@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 import threading
+from flask import Flask
 import queue
 import re
 import os
@@ -1692,10 +1693,38 @@ class FarmBot:
         self.api.edit_message(chat_id, message_id, welcome, get_main_menu())
         Database.save_user_session(user_id, last_section="main_menu")
 
+# ==================== FLASK СЕРВЕР ДЛЯ RENDER ====================
+
+from flask import Flask, request
+import threading
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🌱 Бот фермы 'Смак природи' працює! 🚀"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
+# Запускаем Flask в отдельном потоке
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+print(f"✅ Flask сервер запущено на порті 8080")
+
 # ==================== ЗАПУСК БОТА ====================
 
 if __name__ == "__main__":
     print("🌱 Завантаження бота ферми 'Смак природи'...")
+    
+    # Ініціалізація бази даних
+    init_database()
+    print("✅ База даних ініціалізована")
     
     # Створюємо та запускаємо бота
     bot = FarmBot()
@@ -1715,7 +1744,7 @@ if __name__ == "__main__":
     print(f"• Повідомлень: {stats['total_messages']}")
     print(f"• Користувачів: {stats['total_users']}")
     print("=" * 50)
-
     print("👋 До побачення!")
 #Add farm bot with SQLite database
+
 
