@@ -1717,4 +1717,5 @@ if __name__ == "__main__":
     print("=" * 50)
 
     print("👋 До побачення!")
+#Add farm bot with SQLite database
 
