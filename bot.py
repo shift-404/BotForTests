@@ -418,11 +418,6 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT c.id, c.product_id, c.quantity, 
-                   CASE c.product_id
-            ''', (user_id,))
-        
         # Простий способ без сложных JOIN
         cursor.execute('''
             SELECT id, product_id, quantity FROM carts 
@@ -606,7 +601,7 @@ class Database:
             "active_carts": active_carts
         }
 
-# ==================== ГЕНЕРАТОРИ КЛАВІАТУР (без змін) ====================
+# ==================== ГЕНЕРАТОРИ КЛАВІАТУР ====================
 
 def create_inline_keyboard(buttons: List[List[Dict]]) -> Dict:
     """Створює inline клавіатуру для Telegram"""
@@ -629,7 +624,7 @@ def get_main_menu() -> Dict:
         [{"text": "🏢 Про компанію", "callback_data": "company"}],
         [{"text": "📦 Наші продукти", "callback_data": "products"}],
         [{"text": "❓ Часті запитання", "callback_data": "faq"}],
-        [{"text": "🚀 Швидке замовлення", "callback_data": "quick_order"}],
+        [{"text": "🚀 Написати нам", "callback_data": "quick_message"}],  # ИЗМЕНЕНО!
         [{"text": "🛒 Моя корзина", "callback_data": "cart"}, 
          {"text": "📋 Мої замовлення", "callback_data": "my_orders"}],
         [{"text": "📞 Зв'язатися з нами", "callback_data": "contact"}]
@@ -663,7 +658,6 @@ def get_product_detail_menu(product_id: int) -> Dict:
     """Повертає меню для детальної сторінки продукту"""
     buttons = [
         [{"text": "🛒 Додати в кошик", "callback_data": f"add_to_cart_{product_id}"}],
-        [{"text": "🚀 Замовити зараз", "callback_data": f"order_now_{product_id}"}],
         [{"text": "🔙 Назад", "callback_data": "back_products"}],
     ]
     return create_inline_keyboard(buttons)
@@ -692,11 +686,10 @@ def get_contact_menu() -> Dict:
     ]
     return create_inline_keyboard(buttons)
 
-def get_quick_order_menu() -> Dict:
-    """Повертає меню швидкого замовлення"""
+def get_quick_message_menu() -> Dict:  # НОВЫЙ МЕНЮ!
+    """Повертає меню для швидкого повідомлення"""
     return create_inline_keyboard([
-        [{"text": "📞 Подзвонити мені", "callback_data": "quick_call"}],
-        [{"text": "✍️ Написати мені", "callback_data": "quick_write"}],
+        [{"text": "✍️ Написати повідомлення", "callback_data": "write_quick_message"}],
         [{"text": "🔙 Назад", "callback_data": "back_main_menu"}]
     ])
 
@@ -746,22 +739,6 @@ def parse_quantity(text: str) -> Tuple[bool, float, str]:
         return True, quantity, ""
     except ValueError:
         return False, 0, "❌ Некоректний формат числа"
-
-def validate_phone(phone: str) -> Tuple[bool, str]:
-    """Валідація номера телефону"""
-    phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    
-    if phone.startswith("+380"):
-        if len(phone) == 13 and phone[1:].isdigit():
-            return True, phone
-    elif phone.startswith("380"):
-        if len(phone) == 12 and phone.isdigit():
-            return True, "+" + phone
-    elif phone.startswith("0"):
-        if len(phone) == 10 and phone.isdigit():
-            return True, "+38" + phone
-    
-    return False, "❌ Некоректний номер телефону. Приклад: +380501234567 або 0501234567"
 
 # ==================== ГЕНЕРАТОРИ ТЕКСТУ ====================
 
@@ -858,6 +835,23 @@ def get_contact_text() -> str:
 <i>Просто напишіть нам повідомлення в цьому чаті 👇</i>
     """
 
+def get_quick_message_text() -> str:  # НОВЫЙ ТЕКСТ!
+    """Повертає текст для швидкого повідомлення"""
+    return """
+<b>💬 Написати нам повідомлення</b>
+
+Напишіть ваше повідомлення прямо в цьому чаті:
+
+• Питання про продукти
+• Консультація щодо замовлення
+• Пропозиції співпраці
+• Інші питання
+
+<b>Ми відповімо вам якнайшвидше! ⚡</b>
+
+<i>Просто напишіть ваше повідомлення нижче 👇</i>
+    """
+
 def get_cart_text(cart_items: List[Dict]) -> str:
     """Повертає текст кошика"""
     if not cart_items:
@@ -882,20 +876,6 @@ def get_cart_text(cart_items: List[Dict]) -> str:
     text += "<i>Для оформлення замовлення натисніть кнопку нижче</i>"
     
     return text
-
-def get_quick_order_text() -> str:
-    """Повертає текст швидкого замовлення"""
-    return """
-<b>🚀 Швидке замовлення в один клік</b>
-
-Оберіть спосіб зв'язку:
-
-<b>📞 Подзвонити мені</b> - наш менеджер зателефонує вам
-
-<b>✍️ Написати мені</b> - ми напишемо вам у Telegram
-
-<i>Швидкий спосіб отримати консультацію або оформити замовлення!</i>
-    """
 
 # ==================== ОСНОВНИЙ КЛАС БОТА (АСИНХРОННИЙ) ====================
 
@@ -956,66 +936,61 @@ class FarmBot:
     
     async def handle_message(self, message: Dict):
         """Асинхронна обробка текстових повідомлень"""
-        chat_id = message["chat"]["id"]
-        user = message.get("from", {})
-        user_id = user.get("id")
-        text = message.get("text", "").strip()
-        
-        print(f"👤 [{datetime.now().strftime('%H:%M:%S')}] {user.get('first_name', 'Користувач')}: {text}")
-        
-        # Зберігаємо користувача
-        Database.save_user(
-            user_id,
-            user.get("first_name", ""),
-            user.get("last_name", ""),
-            user.get("username", "")
-        )
-        
-        # Отримуємо стан користувача
-        session = Database.get_user_session(user_id)
-        state = session["state"]
-        temp_data = session["temp_data"]
-        
-        # Обробка команд
-        if text.startswith("/"):
-            if text == "/start":
-                await self._handle_start(chat_id, user_id)
-            elif text == "/help":
-                await self.api.send_message(chat_id, "ℹ️ Допомога: оберіть опцію з меню", get_main_menu())
-            elif text == "/cancel":
-                await self._handle_cancel(chat_id, user_id)
+        try:
+            chat_id = message["chat"]["id"]
+            user = message.get("from", {})
+            user_id = user.get("id")
+            text = message.get("text", "").strip()
+            
+            print(f"👤 [{datetime.now().strftime('%H:%M:%S')}] {user.get('first_name', 'Користувач')}: {text}")
+            print(f"🔍 DEBUG: chat_id={chat_id}, user_id={user_id}, text='{text}'")
+            
+            # Зберігаємо користувача
+            Database.save_user(
+                user_id,
+                user.get("first_name", ""),
+                user.get("last_name", ""),
+                user.get("username", "")
+            )
+            
+            # ВАЖНО: /start и /cancel всегда сбрасывают состояние!
+            if text == "/start" or text == "/cancel" or text.lower() == "скасувати":
+                Database.clear_user_session(user_id)
+                welcome = get_welcome_text()
+                await self.api.send_message(chat_id, welcome, get_main_menu())
+                Database.save_user_session(user_id, last_section="main_menu")
+                return  # Выходим из метода!
+            
+            # Отримуємо стан користувача
+            session = Database.get_user_session(user_id)
+            state = session["state"]
+            temp_data = session["temp_data"]
+            
+            # Обробка інших команд
+            if text.startswith("/"):
+                if text == "/help":
+                    await self.api.send_message(chat_id, "ℹ️ Допомога: оберіть опцію з меню", get_main_menu())
+                else:
+                    await self.api.send_message(chat_id, "🤔 Невідома команда. Використовуйте /start для початку", get_main_menu())
+            
+            # Обробка станів
+            elif state == "waiting_quantity":
+                await self._handle_quantity_input(chat_id, user_id, user, text, temp_data)
+            
+            elif state == "waiting_message" or state == "waiting_quick_message":
+                await self._handle_message_input(chat_id, user_id, user, text, state)
+            
+            elif state.startswith("full_order_"):
+                await self._handle_full_order_input(chat_id, user_id, user, text, state, temp_data)
+            
             else:
-                await self.api.send_message(chat_id, "🤔 Невідома команда. Використовуйте меню", get_main_menu())
-        
-        # Обробка станів
-        elif state == "waiting_quantity":
-            await self._handle_quantity_input(chat_id, user_id, user, text, temp_data)
-        
-        elif state == "waiting_message":
-            await self._handle_message_input(chat_id, user_id, user, text)
-        
-        elif state.startswith("quick_"):
-            await self._handle_quick_order_input(chat_id, user_id, user, text, state, temp_data)
-        
-        elif state.startswith("full_order_"):
-            await self._handle_full_order_input(chat_id, user_id, user, text, state, temp_data)
-        
-        else:
-            # Звичайне повідомлення
-            await self._handle_regular_message(chat_id, user_id, user, text)
-    
-    async def _handle_start(self, chat_id: int, user_id: int):
-        """Обробка команди /start"""
-        Database.clear_user_session(user_id)
-        welcome = get_welcome_text()
-        await self.api.send_message(chat_id, welcome, get_main_menu())
-        Database.save_user_session(user_id, last_section="main_menu")
-    
-    async def _handle_cancel(self, chat_id: int, user_id: int):
-        """Обробка команди /cancel"""
-        Database.clear_user_session(user_id)
-        await self.api.send_message(chat_id, "❌ Дію скасовано.", get_main_menu())
-        Database.save_user_session(user_id, last_section="main_menu")
+                # Звичайне повідомлення
+                await self._handle_regular_message(chat_id, user_id, user, text)
+                
+        except Exception as e:
+            print(f"❌ ОШИБКА В handle_message: {e}")
+            import traceback
+            traceback.print_exc()
     
     async def _handle_quantity_input(self, chat_id: int, user_id: int, user: Dict, text: str, temp_data: Dict):
         """Обробляє введення кількості"""
@@ -1064,17 +1039,20 @@ class FarmBot:
         await self.api.send_message(chat_id, products_text, get_products_menu())
         Database.save_user_session(user_id, last_section="products")
     
-    async def _handle_message_input(self, chat_id: int, user_id: int, user: Dict, text: str):
+    async def _handle_message_input(self, chat_id: int, user_id: int, user: Dict, text: str, state: str):
         """Обробляє введення повідомлення"""
         user_name = f"{user.get('first_name', '')} {user.get('last_name', '')}"
         username = user.get('username', 'немає')
         
+        # Определяем тип сообщения
+        message_type = "повідомлення з кнопки 'Написати нам тут'" if state == "waiting_message" else "швидке повідомлення"
+        
         # Зберігаємо повідомлення
-        Database.save_message(user_id, user_name, username, text, "повідомлення з кнопки 'Написати нам тут'")
+        Database.save_message(user_id, user_name, username, text, message_type)
         
         # Логуємо в консоль
         print(f"\n{'='*80}")
-        print(f"💬 НОВЕ ПОВІДОМЛЕННЯ:")
+        print(f"💬 НОВЕ ПОВІДОМЛЕННЯ ({message_type}):")
         print(f"👤 Ім'я: {user_name}")
         print(f"📱 Username: @{username}" if username != 'немає' else f"📱 Username: немає")
         print(f"🆔 ID: {user_id}")
@@ -1086,75 +1064,6 @@ class FarmBot:
         response = "✅ <b>Повідомлення отримано!</b>\n\n"
         response += "Ми відповімо вам найближчим часом.\n"
         response += "<i>Дякуємо за звернення! 🌱</i>"
-        
-        await self.api.send_message(chat_id, response, get_main_menu())
-        Database.clear_user_session(user_id)
-        Database.save_user_session(user_id, last_section="main_menu")
-    
-    async def _handle_quick_order_input(self, chat_id: int, user_id: int, user: Dict, text: str, state: str, temp_data: Dict):
-        """Обробляє введення для швидкого замовлення"""
-        # Валідація телефону
-        valid, phone_or_error = validate_phone(text)
-        
-        if not valid:
-            response = f"❌ <b>Невірний номер телефону!</b>\n\n{phone_or_error}\n\n"
-            response += "📱 <b>Введіть ваш номер телефону ще раз:</b>\n"
-            response += "<i>Приклад: +380501234567 або 0501234567</i>"
-            
-            await self.api.send_message(chat_id, response)
-            return
-        
-        phone = phone_or_error
-        
-        # Отримуємо дані про товар
-        product_id = temp_data.get("product_id")
-        product = next((p for p in PRODUCTS if p["id"] == product_id), None) if product_id else None
-        
-        # Створюємо замовлення
-        user_name = f"{user.get('first_name', '')} {user.get('last_name', '')}"
-        username = user.get('username', 'немає')
-        order_type = "швидке (подзвонити)" if state == "quick_call" else "швидке (написати)"
-        
-        order_data = {
-            "name": user_name,
-            "username": username,
-            "phone": phone,
-            "city": "",
-            "np_department": "",
-            "total": 0,
-            "order_type": order_type
-        }
-        
-        order_id = Database.create_order(user_id, order_data)
-        
-        # Логуємо
-        print(f"\n{'='*80}")
-        print(f"🚀 НОВЕ ШВИДКЕ ЗАМОВЛЕННЯ #{order_id}:")
-        print(f"👤 Клієнт: {user_name}")
-        print(f"📱 Username: @{username}" if username != 'немає' else f"📱 Username: немає")
-        print(f"📞 Телефон: {phone}")
-        print(f"📦 Товар: {product['name'] if product else 'Не вказано'}")
-        print(f"📊 Тип: {order_type}")
-        print(f"🆔 User ID: {user_id}")
-        print(f"{'='*80}\n")
-        
-        # Надсилаємо підтвердження
-        if state == "quick_call":
-            response = "✅ <b>Швидке замовлення прийнято!</b>\n\n"
-            response += f"🆔 Номер замовлення: <b>#{order_id}</b>\n"
-            response += f"📱 Ваш номер: <b>{phone}</b>\n"
-            if product:
-                response += f"📦 Товар: <b>{product['name']}</b>\n"
-            response += "📞 <b>Наш менеджер зателефонує вам найближчим часом!</b>\n\n"
-            response += "<i>Дякуємо за замовлення! 🌱</i>"
-        else:
-            response = "✅ <b>Швидке замовлення прийнято!</b>\n\n"
-            response += f"🆔 Номер замовлення: <b>#{order_id}</b>\n"
-            response += f"📱 Ваш номер: <b>{phone}</b>\n"
-            if product:
-                response += f"📦 Товар: <b>{product['name']}</b>\n"
-            response += "📧 <b>Ми напишемо вам у Telegram найближчим часом!</b>\n\n"
-            response += "<i>Дякуємо за замовлення! 🌱</i>"
         
         await self.api.send_message(chat_id, response, get_main_menu())
         Database.clear_user_session(user_id)
@@ -1173,17 +1082,29 @@ class FarmBot:
         
         elif state == "full_order_phone":
             # Валідація телефону
-            valid, phone_or_error = validate_phone(text)
+            import re
+            phone = text.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
             
-            if not valid:
-                response = f"❌ <b>Невірний номер телефону!</b>\n\n{phone_or_error}\n\n"
+            # Упрощенная валидация
+            if not re.match(r'^(\+38|38)?0\d{9}$', phone):
+                response = f"❌ <b>Невірний номер телефону!</b>\n\n"
                 response += "📱 <b>Введіть ваш номер телефону ще раз:</b>\n"
                 response += "<i>Приклад: +380501234567 або 0501234567</i>"
                 
                 await self.api.send_message(chat_id, response)
                 return
             
-            temp_data["phone"] = phone_or_error
+            # Приводим к стандартному формату
+            if phone.startswith("0"):
+                phone = "+38" + phone
+            elif phone.startswith("38"):
+                phone = "+" + phone
+            elif phone.startswith("+380"):
+                pass
+            else:
+                phone = "+380" + phone[1:] if phone.startswith("+") else "+380" + phone
+            
+            temp_data["phone"] = phone
             Database.save_user_session(user_id, "full_order_city", temp_data)
             
             response = "🏙️ <b>Введіть місто доставки:</b>\n\n"
@@ -1288,20 +1209,17 @@ class FarmBot:
         elif data.startswith("add_to_cart_"):
             await self._handle_add_to_cart(chat_id, message_id, user_id, data)
         
-        elif data.startswith("order_now_"):
-            await self._handle_order_now(chat_id, message_id, user_id, data)
-        
         elif data == "faq":
             await self._handle_faq(chat_id, message_id, user_id)
         
         elif data.startswith("faq_"):
             await self._handle_faq_detail(chat_id, message_id, user_id, data)
         
-        elif data == "quick_order":
-            await self._handle_quick_order(chat_id, message_id, user_id)
+        elif data == "quick_message":  # ИЗМЕНЕНО!
+            await self._handle_quick_message(chat_id, message_id, user_id)
         
-        elif data in ["quick_call", "quick_write"]:
-            await self._handle_quick_order_type(chat_id, message_id, user_id, data)
+        elif data == "write_quick_message":  # НОВЫЙ ОБРАБОТЧИК!
+            await self._handle_write_quick_message(chat_id, message_id, user_id)
         
         elif data == "cart":
             await self._handle_cart(chat_id, message_id, user_id)
@@ -1357,10 +1275,10 @@ class FarmBot:
             await self.api.edit_message(chat_id, message_id, contact_text, get_contact_menu())
             Database.save_user_session(user_id, last_section="contact")
         
-        elif back_target == "quick_order":
-            quick_order_text = get_quick_order_text()
-            await self.api.edit_message(chat_id, message_id, quick_order_text, get_quick_order_menu())
-            Database.save_user_session(user_id, last_section="quick_order")
+        elif back_target == "quick_message":
+            quick_message_text = get_quick_message_text()
+            await self.api.edit_message(chat_id, message_id, quick_message_text, get_quick_message_menu())
+            Database.save_user_session(user_id, last_section="quick_message")
         
         elif back_target == "cart":
             await self._handle_cart(chat_id, message_id, user_id)
@@ -1420,37 +1338,6 @@ class FarmBot:
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка додавання до кошика", get_back_keyboard("products"))
     
-    async def _handle_order_now(self, chat_id: int, message_id: int, user_id: int, data: str):
-        """Обробляє кнопку 'Замовити зараз'"""
-        try:
-            product_id = int(data.split("_")[2])
-            product = next((p for p in PRODUCTS if p["id"] == product_id), None)
-            
-            if not product:
-                await self.api.edit_message(chat_id, message_id, "❌ Продукт не знайдено", get_back_keyboard(f"product_{product_id}"))
-                return
-            
-            # Зберігаємо дані для швидкого замовлення
-            temp_data = {"product_id": product_id}
-            Database.save_user_session(user_id, "", temp_data)
-            
-            # Видаляємо повідомлення
-            await self.api.delete_message(chat_id, message_id)
-            
-            # Показуємо меню швидкого замовлення
-            response = f"🚀 <b>Швидке замовлення: {product['name']}</b>\n\n"
-            response += f"💰 Ціна: {product['price']} грн/кг\n\n"
-            response += "<b>Оберіть спосіб зв'язку:</b>\n\n"
-            response += "📞 <b>Подзвонити мені</b> - наш менеджер зателефонує вам\n\n"
-            response += "✍️ <b>Написати мені</b> - ми напишемо вам у Telegram\n\n"
-            response += "<i>Після вибору вам потрібно буде ввести номер телефону</i>"
-            
-            await self.api.send_message(chat_id, response, get_quick_order_menu())
-            Database.save_user_session(user_id, last_section="quick_order")
-            
-        except:
-            await self.api.edit_message(chat_id, message_id, "❌ Помилка створення замовлення", get_back_keyboard("products"))
-    
     async def _handle_faq(self, chat_id: int, message_id: int, user_id: int):
         """Обробляє кнопку 'Часті запитання'"""
         faq_text = "❓ <b>Часті запитання</b>\n\nОберіть питання для отримання відповіді:"
@@ -1466,34 +1353,27 @@ class FarmBot:
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка завантаження питання", get_back_keyboard("faq"))
     
-    async def _handle_quick_order(self, chat_id: int, message_id: int, user_id: int):
-        """Обробляє кнопку 'Швидке замовлення'"""
-        quick_order_text = get_quick_order_text()
-        await self.api.edit_message(chat_id, message_id, quick_order_text, get_quick_order_menu())
-        Database.save_user_session(user_id, last_section="quick_order")
+    async def _handle_quick_message(self, chat_id: int, message_id: int, user_id: int):
+        """Обробляє кнопку 'Написати нам'"""
+        quick_message_text = get_quick_message_text()
+        await self.api.edit_message(chat_id, message_id, quick_message_text, get_quick_message_menu())
+        Database.save_user_session(user_id, last_section="quick_message")
     
-    async def _handle_quick_order_type(self, chat_id: int, message_id: int, user_id: int, data: str):
-        """Обробляє вибір типу швидкого замовлення"""
-        state = "quick_call" if data == "quick_call" else "quick_write"
-        
-        # Отримуємо поточну сесію
-        session = Database.get_user_session(user_id)
-        temp_data = session["temp_data"]
-        
-        Database.save_user_session(user_id, state, temp_data)
+    async def _handle_write_quick_message(self, chat_id: int, message_id: int, user_id: int):
+        """Обробляє кнопку 'Написати повідомлення' для швидкого замовлення"""
+        Database.save_user_session(user_id, "waiting_quick_message")
         
         # Видаляємо повідомлення
         await self.api.delete_message(chat_id, message_id)
         
-        # Запитуємо номер телефону
-        response = "📱 <b>Швидке замовлення</b>\n\n"
-        response += "Введіть ваш номер телефону:\n\n"
-        response += "<i>Приклад: +380501234567 або 0501234567</i>\n\n"
-        
-        if state == "quick_call":
-            response += "<b>Наш менеджер зателефонує вам найближчим часом!</b>"
-        else:
-            response += "<b>Ми напишемо вам у Telegram найближчим часом!</b>"
+        response = "💬 <b>Написати нам повідомлення</b>\n\n"
+        response += "Напишіть ваше повідомлення прямо в цьому чаті:\n\n"
+        response += "• Питання про продукти\n"
+        response += "• Консультація щодо замовлення\n"
+        response += "• Пропозиції співпраці\n"
+        response += "• Інші питання\n\n"
+        response += "<b>Ми відповімо вам якнайшвидше! ⚡</b>\n\n"
+        response += "<i>Просто напишіть ваше повідомлення нижче 👇</i>"
         
         await self.api.send_message(chat_id, response)
     
