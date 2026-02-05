@@ -17,7 +17,7 @@ import threading
 import queue
 import re
 import os
-TOKEN = os.getenv("")
+TOKEN = os.getenv("BOT_TOKEN")
 
 API_URL = f"api.telegram.org"
 
@@ -1717,3 +1717,4 @@ if __name__ == "__main__":
     print("=" * 50)
 
     print("👋 До побачення!")
+
