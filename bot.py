@@ -1804,7 +1804,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🌱 Бот ферми "Смак природи"</title>
+        <title>Бот ферми "Смак природи"</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -1882,3 +1882,4 @@ if __name__ == "__main__":
     # Запускаем бота
     asyncio.run(main())
     
+
