@@ -14,6 +14,14 @@ import re
 from threading import Thread
 from flask import Flask
 
+# Добавьте сразу после импортов
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    print("❌ ОШИБКА: Токен не найден! Проверьте переменную окружения BOT_TOKEN в Render")
+    exit(1)
+else:
+    print(f"✅ Токен получен (первые 10 символов): {TOKEN[:10]}...")
 # ==================== БАЗА ДАНИХ ====================
 
 def init_database():
@@ -1615,3 +1623,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
