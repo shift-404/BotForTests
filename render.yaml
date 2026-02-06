@@ -2,8 +2,7 @@ services:
   - type: web
     name: farm-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --force-reinstall --no-cache-dir -r requirements.txt
     startCommand: python bot.py
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
