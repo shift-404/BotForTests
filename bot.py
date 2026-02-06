@@ -1,6 +1,5 @@
 """
-Телеграм-бот для ферми "Смак природи" - ОПТИМИЗИРОВАННАЯ ВЕРСІЯ
-Асинхронна робота з високою швидкістю відповіді
+БОТ ФЕРМИ "СМАК ПРИРОДИ" - ПОЛНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
 """
 
 import os
@@ -11,23 +10,36 @@ import sqlite3
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import re
-from threading import Thread
-from flask import Flask
 import logging
+from flask import Flask
+import threading
 
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+# ==================== НАСТРОЙКА ====================
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# Проверка токена
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    logger.error("❌ ОШИБКА: Токен не найден!")
+    logger.error("Добавьте BOT_TOKEN в переменные окружения Render")
+    exit(1)
+
+logger.info(f"✅ Токен получен (первые 10 символов): {TOKEN[:10]}...")
 
 # ==================== БАЗА ДАНИХ ====================
 
 def init_database():
     """Ініціалізація бази даних"""
-    conn = sqlite3.connect('farm_bot.db')
+    conn = sqlite3.connect('farm_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
     # Таблиця користувачів
@@ -41,6 +53,17 @@ def init_database():
         )
     ''')
     
+    # Таблиця сесій
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT DEFAULT '',
+            temp_data TEXT DEFAULT '{}',
+            last_section TEXT DEFAULT 'main_menu',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     # Таблиця кошиків
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS carts (
@@ -48,8 +71,7 @@ def init_database():
             user_id INTEGER,
             product_id INTEGER,
             quantity REAL,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -66,8 +88,7 @@ def init_database():
             total REAL,
             status TEXT DEFAULT 'нове',
             order_type TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -78,8 +99,7 @@ def init_database():
             order_id INTEGER,
             product_name TEXT,
             quantity REAL,
-            price_per_unit REAL,
-            FOREIGN KEY (order_id) REFERENCES orders (order_id)
+            price_per_unit REAL
         )
     ''')
     
@@ -92,24 +112,11 @@ def init_database():
             username TEXT,
             text TEXT,
             message_type TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Таблиця сесій користувачів
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            user_id INTEGER PRIMARY KEY,
-            state TEXT DEFAULT '',
-            temp_data TEXT DEFAULT '{}',
-            last_section TEXT DEFAULT 'main_menu',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
-        )
-    ''')
-    
-    # Таблица быстрых заказов
+    # Таблиця швидких замовлень
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS quick_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,24 +129,27 @@ def init_database():
             quantity REAL,
             contact_method TEXT,
             status TEXT DEFAULT 'нове',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
     conn.commit()
     conn.close()
-
-TOKEN = os.getenv("BOT_TOKEN")
-
-if not TOKEN:
-    logger.error("❌ ОШИБКА: Токен не найден! Проверьте переменную окружения BOT_TOKEN в Render")
-    exit(1)
-else:
-    logger.info(f"✅ Токен получен (первые 10 символов): {TOKEN[:10]}...")
+    logger.info("✅ База данных инициализирована")
 
 # ==================== ДАНІ ПРОДУКТІВ ====================
 
+# URL фотографій для товарів (используем Render как хостинг)
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://botfortests.onrender.com")
+
+PRODUCT_PHOTOS = {
+    1: f"{BASE_URL}/static/products/1.jpg",  # Артишоки
+    2: f"{BASE_URL}/static/products/2.jpg",  # Спаржа
+    3: f"{BASE_URL}/static/products/3.jpg",  # Яблука
+    4: f"{BASE_URL}/static/products/4.jpg",  # Інжир
+    5: f"{BASE_URL}/static/products/5.jpg",  # Горіхи
+    6: f"{BASE_URL}/static/products/6.jpg"   # Мед
+}
 PRODUCTS = [
     {
         "id": 1,
@@ -233,7 +243,7 @@ COMPANY_INFO = {
     ]
 }
 
-# ==================== ОПТИМИЗОВАНІ УТІЛІТИ ДЛЯ РОБОТИ З TELEGRAM API ====================
+# ==================== TELEGRAM API ====================
 
 class TelegramAPI:
     """Асинхронний клас для роботи з Telegram API"""
@@ -242,49 +252,76 @@ class TelegramAPI:
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.session = None
-        self._session_lock = asyncio.Lock()
+        self.last_update_id = 0
         
-    async def get_session(self):
-        """Получает или создает aiohttp сессию"""
+    async def ensure_session(self):
+        """Создает сессию если ее нет"""
         if self.session is None or self.session.closed:
-            async with self._session_lock:
-                if self.session is None or self.session.closed:
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    connector = aiohttp.TCPConnector(limit=100)
-                    self.session = aiohttp.ClientSession(
-                        timeout=timeout,
-                        connector=connector
-                    )
-        return self.session
+            timeout = aiohttp.ClientTimeout(total=60)
+            connector = aiohttp.TCPConnector(ssl=False)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector
+            )
     
-    async def _make_request(self, method: str, data: dict = None, params: dict = None) -> dict:
-        """Виконує асинхронний HTTP запит"""
+    async def close(self):
+        """Закрывает сессию"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+    
+    async def make_request(self, method: str, data: dict = None, params: dict = None) -> dict:
+        """Выполняет запрос к Telegram API"""
         try:
-            session = await self.get_session()
+            await self.ensure_session()
             url = f"{self.base_url}/{method}"
             
-            async with session.post(url, json=data, params=params) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    text = await response.text()
-                    logger.error(f"❌ Помилка API {method}: {response.status} - {text[:100]}")
-                    return {"ok": False}
+            if params:
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"❌ Ошибка {method}: {response.status} - {error_text[:200]}")
+                        return {"ok": False, "error_code": response.status}
+            else:
+                async with self.session.post(url, json=data) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"❌ Ошибка {method}: {response.status} - {error_text[:200]}")
+                        return {"ok": False, "error_code": response.status}
                     
         except Exception as e:
-            logger.error(f"❌ Помилка запиту {method}: {e}")
+            logger.error(f"❌ Ошибка запроса {method}: {str(e)}")
             return {"ok": False}
     
-    async def get_updates(self, offset: int = 0, timeout: int = 30) -> list:
-        """Отримує оновлення асинхронно (увеличиваем timeout для Render)"""
-        params = {"offset": offset, "timeout": timeout, "limit": 100}
-        result = await self._make_request("getUpdates", params=params)
-        return result.get("result", [])
+    async def get_updates(self, timeout: int = 30) -> list:
+        """Получает обновления с использованием last_update_id"""
+        params = {
+            "offset": self.last_update_id + 1,
+            "timeout": timeout,
+            "limit": 100
+        }
+        
+        result = await self.make_request("getUpdates", params=params)
+        
+        if result.get("ok"):
+            updates = result.get("result", [])
+            if updates:
+                self.last_update_id = updates[-1]["update_id"]
+            return updates
+        else:
+            # Если ошибка 409 - ждем и пробуем снова
+            if result.get("error_code") == 409:
+                logger.warning("⚠️ Конфликт с другим экземпляром бота. Жду 5 секунд...")
+                await asyncio.sleep(5)
+            return []
     
     async def send_message(self, chat_id: int, text: str, 
                           reply_markup: dict = None,
                           parse_mode: str = "HTML") -> bool:
-        """Надсилає повідомлення користувачеві асинхронно"""
+        """Отправляет сообщение"""
         data = {
             "chat_id": chat_id,
             "text": text,
@@ -294,12 +331,21 @@ class TelegramAPI:
         if reply_markup:
             data["reply_markup"] = reply_markup
         
-        result = await self._make_request("sendMessage", data=data)
+        result = await self.make_request("sendMessage", data=data)
+        return result.get("ok", False)
+    
+    async def answer_callback(self, callback_id: str, text: str = None) -> bool:
+        """Отвечает на callback запрос"""
+        data = {"callback_query_id": callback_id}
+        if text:
+            data["text"] = text
+        
+        result = await self.make_request("answerCallbackQuery", data=data)
         return result.get("ok", False)
     
     async def edit_message(self, chat_id: int, message_id: int, text: str,
                           reply_markup: dict = None) -> bool:
-        """Редагує існуюче повідомлення асинхронно"""
+        """Редактирует сообщение"""
         data = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -310,34 +356,20 @@ class TelegramAPI:
         if reply_markup:
             data["reply_markup"] = reply_markup
         
-        result = await self._make_request("editMessageText", data=data)
-        return result.get("ok", False)
-    
-    async def answer_callback(self, callback_id: str, text: str = None) -> bool:
-        """Відповідає на callback запит асинхронно"""
-        data = {"callback_query_id": callback_id}
-        if text:
-            data["text"] = text
-        
-        result = await self._make_request("answerCallbackQuery", data=data)
+        result = await self.make_request("editMessageText", data=data)
         return result.get("ok", False)
     
     async def delete_message(self, chat_id: int, message_id: int) -> bool:
-        """Видаляє повідомлення асинхронно"""
+        """Удаляет сообщение"""
         data = {
             "chat_id": chat_id,
             "message_id": message_id
         }
         
-        result = await self._make_request("deleteMessage", data=data)
+        result = await self.make_request("deleteMessage", data=data)
         return result.get("ok", False)
-    
-    async def close(self):
-        """Закриває сесію"""
-        if self.session and not self.session.closed:
-            await self.session.close()
 
-# ==================== УТІЛІТИ ДЛЯ РОБОТИ З БАЗОЮ ДАНИХ (оптимізовані) ====================
+# ==================== УТІЛІТИ БАЗИ ДАНИХ ====================
 
 class Database:
     """Клас для роботи з базою даних"""
@@ -345,7 +377,7 @@ class Database:
     @staticmethod
     def get_connection():
         """Повертає з'єднання з базою даних"""
-        return sqlite3.connect('farm_bot.db', check_same_thread=False)
+        return sqlite3.connect('farm_bot.db', timeout=20, check_same_thread=False)
     
     @staticmethod
     def save_user(user_id: int, first_name: str = "", last_name: str = "", username: str = ""):
@@ -353,13 +385,17 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT OR REPLACE INTO users (user_id, first_name, last_name, username)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, first_name, last_name, username))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (user_id, first_name, last_name, username)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, first_name, last_name, username))
+            
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения пользователя: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
     def get_user_session(user_id: int) -> Dict:
@@ -367,24 +403,29 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT state, temp_data, last_section 
-            FROM user_sessions 
-            WHERE user_id = ?
-        ''', (user_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            state, temp_data_json, last_section = row
-            temp_data = json.loads(temp_data_json) if temp_data_json else {}
-            return {
-                "state": state,
-                "temp_data": temp_data,
-                "last_section": last_section
-            }
-        return {"state": "", "temp_data": {}, "last_section": "main_menu"}
+        try:
+            cursor.execute('''
+                SELECT state, temp_data, last_section 
+                FROM user_sessions 
+                WHERE user_id = ?
+            ''', (user_id,))
+            
+            row = cursor.fetchone()
+            
+            if row:
+                state, temp_data_json, last_section = row
+                temp_data = json.loads(temp_data_json) if temp_data_json else {}
+                return {
+                    "state": state,
+                    "temp_data": temp_data,
+                    "last_section": last_section
+                }
+            return {"state": "", "temp_data": {}, "last_section": "main_menu"}
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения сессии: {e}")
+            return {"state": "", "temp_data": {}, "last_section": "main_menu"}
+        finally:
+            conn.close()
     
     @staticmethod
     def save_user_session(user_id: int, state: str = "", temp_data: Dict = None, last_section: str = ""):
@@ -392,15 +433,19 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        temp_data_json = json.dumps(temp_data) if temp_data else "{}"
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO user_sessions (user_id, state, temp_data, last_section, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, state, temp_data_json, last_section))
-        
-        conn.commit()
-        conn.close()
+        try:
+            temp_data_json = json.dumps(temp_data) if temp_data else "{}"
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO user_sessions (user_id, state, temp_data, last_section, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, state, temp_data_json, last_section))
+            
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения сессии: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
     def clear_user_session(user_id: int):
@@ -408,86 +453,91 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            DELETE FROM user_sessions WHERE user_id = ?
-        ''', (user_id,))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor.execute('DELETE FROM user_sessions WHERE user_id = ?', (user_id,))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки сессии: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
     def add_to_cart(user_id: int, product_id: int, quantity: float) -> bool:
-        """Додає товар до кошика або оновлює кількість"""
+        """Додає товар до кошика"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT id, quantity FROM carts 
-            WHERE user_id = ? AND product_id = ?
-        ''', (user_id, product_id))
-        
-        existing = cursor.fetchone()
-        
-        if existing:
-            cart_id, old_quantity = existing
-            new_quantity = old_quantity + quantity
+        try:
+            # Проверяем, есть ли уже товар в корзине
             cursor.execute('''
-                UPDATE carts SET quantity = ?, added_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (new_quantity, cart_id))
-        else:
-            cursor.execute('''
-                INSERT INTO carts (user_id, product_id, quantity)
-                VALUES (?, ?, ?)
-            ''', (user_id, product_id, quantity))
-        
-        conn.commit()
-        conn.close()
-        return True
+                SELECT id, quantity FROM carts 
+                WHERE user_id = ? AND product_id = ?
+            ''', (user_id, product_id))
+            
+            existing = cursor.fetchone()
+            
+            if existing:
+                cart_id, old_quantity = existing
+                new_quantity = old_quantity + quantity
+                cursor.execute('''
+                    UPDATE carts SET quantity = ?, added_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (new_quantity, cart_id))
+            else:
+                cursor.execute('''
+                    INSERT INTO carts (user_id, product_id, quantity)
+                    VALUES (?, ?, ?)
+                ''', (user_id, product_id, quantity))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления в корзину: {e}")
+            return False
+        finally:
+            conn.close()
     
     @staticmethod
     def get_cart_items(user_id: int) -> List[Dict]:
-        """Отримує товари з кошика користувача"""
+        """Отримує товари з кошика"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT id, product_id, quantity FROM carts 
-            WHERE user_id = ?
-        ''', (user_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        items = []
-        for row in rows:
-            cart_id, product_id, quantity = row
-            product = next((p for p in PRODUCTS if p["id"] == product_id), None)
-            if product:
-                items.append({
-                    "cart_id": cart_id,
-                    "product": {
-                        "id": product_id,
-                        "name": product["name"],
-                        "price": product["price"],
-                        "unit": product["unit"],
-                        "image": product["image"]
-                    },
-                    "quantity": quantity
-                })
-        
-        return items
+        try:
+            cursor.execute('SELECT id, product_id, quantity FROM carts WHERE user_id = ?', (user_id,))
+            rows = cursor.fetchall()
+            
+            items = []
+            for row in rows:
+                cart_id, product_id, quantity = row
+                product = next((p for p in PRODUCTS if p["id"] == product_id), None)
+                if product:
+                    items.append({
+                        "cart_id": cart_id,
+                        "product": product,
+                        "quantity": quantity
+                    })
+            
+            return items
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения корзины: {e}")
+            return []
+        finally:
+            conn.close()
     
     @staticmethod
     def clear_cart(user_id: int):
-        """Очищає кошик користувача"""
+        """Очищає кошик"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('DELETE FROM carts WHERE user_id = ?', (user_id,))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor.execute('DELETE FROM carts WHERE user_id = ?', (user_id,))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки корзины: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
     def remove_from_cart(cart_id: int):
@@ -495,136 +545,105 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('DELETE FROM carts WHERE id = ?', (cart_id,))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor.execute('DELETE FROM carts WHERE id = ?', (cart_id,))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления из корзины: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
-    def create_order(user_id: int, order_data: Dict) -> int:
-        """Створює нове замовлення"""
+    def create_order(order_data: Dict) -> int:
+        """Створює замовлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO orders (user_id, user_name, username, phone, city, np_department, total, order_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id,
-            order_data.get("name", ""),
-            order_data.get("username", ""),
-            order_data.get("phone", ""),
-            order_data.get("city", ""),
-            order_data.get("np_department", ""),
-            order_data.get("total", 0),
-            order_data.get("order_type", "")
-        ))
-        
-        order_id = cursor.lastrowid
-        
-        # Додаємо товари до замовлення
-        cart_items = Database.get_cart_items(user_id)
-        for item in cart_items:
+        try:
+            # Используем транзакцию для избежания блокировок
+            cursor.execute('BEGIN TRANSACTION')
+            
             cursor.execute('''
-                INSERT INTO order_items (order_id, product_name, quantity, price_per_unit)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO orders (user_id, user_name, username, phone, city, np_department, total, order_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                order_id,
-                item["product"]["name"],
-                item["quantity"],
-                item["product"]["price"]
+                order_data.get("user_id"),
+                order_data.get("user_name"),
+                order_data.get("username"),
+                order_data.get("phone"),
+                order_data.get("city"),
+                order_data.get("np_department"),
+                order_data.get("total"),
+                order_data.get("order_type")
             ))
-        
-        Database.clear_cart(user_id)
-        
-        conn.commit()
-        conn.close()
-        return order_id
+            
+            order_id = cursor.lastrowid
+            
+            # Добавляем товары в заказ
+            for item in order_data.get("items", []):
+                cursor.execute('''
+                    INSERT INTO order_items (order_id, product_name, quantity, price_per_unit)
+                    VALUES (?, ?, ?, ?)
+                ''', (
+                    order_id,
+                    item.get("product_name"),
+                    item.get("quantity"),
+                    item.get("price")
+                ))
+            
+            # Очищаем корзину
+            cursor.execute('DELETE FROM carts WHERE user_id = ?', (order_data.get("user_id"),))
+            
+            conn.commit()
+            return order_id
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания заказа: {e}")
+            conn.rollback()
+            return 0
+        finally:
+            conn.close()
     
     @staticmethod
     def save_message(user_id: int, user_name: str, username: str, text: str, message_type: str):
-        """Зберігає повідомлення від користувача"""
+        """Зберігає повідомлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO messages (user_id, user_name, username, text, message_type)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, user_name, username, text, message_type))
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor.execute('''
+                INSERT INTO messages (user_id, user_name, username, text, message_type)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, user_name, username, text, message_type))
+            
+            conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения сообщения: {e}")
+        finally:
+            conn.close()
     
     @staticmethod
     def save_quick_order(user_id: int, user_name: str, username: str, product_id: int, 
                         product_name: str, quantity: float, phone: str = None, 
                         contact_method: str = "chat") -> int:
-        """Сохранение быстрого заказа"""
+        """Зберігає швидке замовлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO quick_orders (user_id, user_name, username, product_id, product_name, 
-                                    quantity, phone, contact_method)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, user_name, username, product_id, product_name, quantity, phone, contact_method))
-        
-        order_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        return order_id
-    
-    @staticmethod
-    def get_user_orders(user_id: int, limit: int = 5) -> List[Dict]:
-        """Отримує замовлення користувача"""
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT order_id, user_name, phone, city, np_department, 
-                   total, status, order_type, created_at
-            FROM orders 
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        ''', (user_id, limit))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        orders = []
-        for row in rows:
-            (order_id, user_name, phone, city, np_department, 
-             total, status, order_type, created_at) = row
+        try:
+            cursor.execute('''
+                INSERT INTO quick_orders (user_id, user_name, username, product_id, product_name, 
+                                        quantity, phone, contact_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, user_name, username, product_id, product_name, quantity, phone, contact_method))
             
-            # Отримуємо товари для замовлення
-            conn2 = Database.get_connection()
-            cursor2 = conn2.cursor()
-            cursor2.execute('''
-                SELECT product_name, quantity 
-                FROM order_items 
-                WHERE order_id = ?
-            ''', (order_id,))
-            products_rows = cursor2.fetchall()
-            conn2.close()
-            
-            products = ", ".join([f"{name} ({qty}кг)" for name, qty in products_rows])
-            
-            orders.append({
-                "order_id": order_id,
-                "user_name": user_name,
-                "phone": phone,
-                "city": city,
-                "np_department": np_department,
-                "total": total,
-                "status": status,
-                "order_type": order_type,
-                "created_at": created_at,
-                "products": products
-            })
-        
-        return orders
+            order_id = cursor.lastrowid
+            conn.commit()
+            return order_id
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения быстрого заказа: {e}")
+            return 0
+        finally:
+            conn.close()
     
     @staticmethod
     def get_statistics() -> Dict:
@@ -632,35 +651,39 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT COUNT(*) FROM orders')
-        total_orders = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM messages')
-        total_messages = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
-        total_users = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM carts')
-        active_carts = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM quick_orders')
-        quick_orders = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        return {
-            "total_orders": total_orders,
-            "total_messages": total_messages,
-            "total_users": total_users,
-            "active_carts": active_carts,
-            "quick_orders": quick_orders
-        }
+        try:
+            cursor.execute('SELECT COUNT(*) FROM orders')
+            total_orders = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM messages')
+            total_messages = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(DISTINCT user_id) FROM carts')
+            active_carts = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM quick_orders')
+            quick_orders = cursor.fetchone()[0]
+            
+            return {
+                "total_orders": total_orders,
+                "total_messages": total_messages,
+                "total_users": total_users,
+                "active_carts": active_carts,
+                "quick_orders": quick_orders
+            }
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+            return {}
+        finally:
+            conn.close()
 
 # ==================== ГЕНЕРАТОРИ КЛАВІАТУР ====================
 
 def create_inline_keyboard(buttons: List[List[Dict]]) -> Dict:
-    """Створює inline клавіатуру для Telegram"""
+    """Створює inline клавіатуру"""
     keyboard = []
     
     for row in buttons:
@@ -675,12 +698,11 @@ def create_inline_keyboard(buttons: List[List[Dict]]) -> Dict:
     return {"inline_keyboard": keyboard}
 
 def get_main_menu() -> Dict:
-    """Повертає головне меню"""
+    """Головне меню"""
     buttons = [
         [{"text": "🏢 Про компанію", "callback_data": "company"}],
         [{"text": "📦 Наші продукти", "callback_data": "products"}],
         [{"text": "❓ Часті запитання", "callback_data": "faq"}],
-        [{"text": "🚀 Написати нам", "callback_data": "quick_message"}],
         [{"text": "🛒 Моя корзина", "callback_data": "cart"}, 
          {"text": "📋 Мої замовлення", "callback_data": "my_orders"}],
         [{"text": "📞 Зв'язатися з нами", "callback_data": "contact"}]
@@ -688,48 +710,42 @@ def get_main_menu() -> Dict:
     return create_inline_keyboard(buttons)
 
 def get_back_keyboard(back_to: str) -> Dict:
-    """Повертає кнопку 'Назад' на попередню сторінку"""
+    """Повертає кнопку 'Назад'"""
     return create_inline_keyboard([[{"text": "🔙 Назад", "callback_data": f"back_{back_to}"}]])
 
 def get_products_menu() -> Dict:
-    """Повертає меню продуктів"""
+    """Меню продуктів"""
     buttons = []
     
-    for i in range(0, len(PRODUCTS), 2):
-        row = []
-        for j in range(2):
-            if i + j < len(PRODUCTS):
-                product = PRODUCTS[i + j]
-                row.append({
-                    "text": f"{product['image']} {product['name']}",
-                    "callback_data": f"product_{product['id']}"
-                })
-        if row:
-            buttons.append(row)
+    for product in PRODUCTS:
+        buttons.append([{
+            "text": f"{product['image']} {product['name']} - {product['price']} грн/{product['unit']}",
+            "callback_data": f"product_{product['id']}"
+        }])
     
     buttons.append([{"text": "🔙 Назад", "callback_data": "back_main_menu"}])
     return create_inline_keyboard(buttons)
 
 def get_product_detail_menu(product_id: int) -> Dict:
-    """Повертає меню для детальної сторінки продукту"""
+    """Меню деталей продукту"""
     buttons = [
         [{"text": "🛒 Додати в кошик", "callback_data": f"add_to_cart_{product_id}"}],
         [{"text": "⚡ Швидке замовлення", "callback_data": f"quick_order_{product_id}"}],
-        [{"text": "🔙 Назад", "callback_data": "back_products"}],
+        [{"text": "🔙 Назад", "callback_data": "back_products"}]
     ]
     return create_inline_keyboard(buttons)
 
 def get_quick_order_menu(product_id: int) -> Dict:
-    """Повертає меню для швидкого замовлення"""
+    """Меню швидкого замовлення"""
     buttons = [
         [{"text": "📞 Зателефонуйте мені", "callback_data": f"quick_call_{product_id}"}],
         [{"text": "💬 Напишіть мені в чат", "callback_data": f"quick_chat_{product_id}"}],
-        [{"text": "🔙 Назад", "callback_data": f"product_{product_id}"}],
+        [{"text": "🔙 Назад", "callback_data": f"product_{product_id}"}]
     ]
     return create_inline_keyboard(buttons)
 
 def get_faq_menu() -> Dict:
-    """Повертає меню FAQ"""
+    """Меню FAQ"""
     buttons = []
     
     for i, faq in enumerate(FAQS, 1):
@@ -742,7 +758,7 @@ def get_faq_menu() -> Dict:
     return create_inline_keyboard(buttons)
 
 def get_contact_menu() -> Dict:
-    """Повертає меню контактів"""
+    """Меню контактів"""
     buttons = [
         [{"text": "📞 Зателефонувати", "callback_data": "call_us"}],
         [{"text": "📧 Написати email", "callback_data": "email_us"}],
@@ -752,24 +768,21 @@ def get_contact_menu() -> Dict:
     ]
     return create_inline_keyboard(buttons)
 
-def get_quick_message_menu() -> Dict:
-    """Повертає меню для швидкого повідомлення"""
-    return create_inline_keyboard([
-        [{"text": "✍️ Написати повідомлення", "callback_data": "write_quick_message"}],
-        [{"text": "🔙 Назад", "callback_data": "back_main_menu"}]
-    ])
-
 def get_cart_menu(cart_items: List) -> Dict:
-    """Повертає меню кошика"""
+    """Меню корзини"""
     buttons = []
     
     if cart_items:
         buttons.append([{"text": "✅ Оформити замовлення", "callback_data": "checkout_cart"}])
         buttons.append([{"text": "🗑️ Очистити корзину", "callback_data": "clear_cart"}])
+        
         for item in cart_items:
-            product_name = item["product"]["name"][:20] + "..." if len(item["product"]["name"]) > 20 else item["product"]["name"]
+            product_name = item["product"]["name"][:20]
+            if len(item["product"]["name"]) > 20:
+                product_name += "..."
+            
             buttons.append([{
-                "text": f"❌ {product_name} ({item['quantity']}кг)",
+                "text": f"❌ {product_name} ({item['quantity']}{item['product']['unit']})",
                 "callback_data": f"remove_from_cart_{item['cart_id']}"
             }])
     
@@ -777,7 +790,7 @@ def get_cart_menu(cart_items: List) -> Dict:
     return create_inline_keyboard(buttons)
 
 def get_order_confirmation_keyboard() -> Dict:
-    """Повертає клавіатуру для підтвердження замовлення"""
+    """Клавіатура підтвердження замовлення"""
     return create_inline_keyboard([
         [{"text": "✅ Так, продовжити", "callback_data": "confirm_order_yes"}],
         [{"text": "❌ Ні, скасувати", "callback_data": "confirm_order_no"}]
@@ -786,7 +799,7 @@ def get_order_confirmation_keyboard() -> Dict:
 # ==================== УТІЛІТИ ДЛЯ ВАЛІДАЦІЇ ====================
 
 def parse_quantity(text: str) -> Tuple[bool, float, str]:
-    """Парсить кількість з тексту"""
+    """Парсить кількість"""
     text = text.strip().replace(" ", "")
     match = re.search(r'(\d+(?:[.,]\d+)?)', text)
     
@@ -800,17 +813,16 @@ def parse_quantity(text: str) -> Tuple[bool, float, str]:
         if quantity <= 0:
             return False, 0, "❌ Кількість повинна бути більше 0"
         if quantity > 100:
-            return False, 0, "❌ Занадто велика кількість. Максимум 100 кг"
+            return False, 0, "❌ Занадто велика кількість. Максимум 100"
         
         return True, quantity, ""
     except ValueError:
         return False, 0, "❌ Некоректний формат числа"
 
 def validate_phone(phone: str) -> Tuple[bool, str]:
-    """Валідація номера телефону"""
+    """Валідує телефон"""
     phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     
-    # Простая валидация
     if re.match(r'^(\+38|38)?0\d{9}$', phone):
         if phone.startswith("0"):
             phone = "+38" + phone
@@ -828,7 +840,6 @@ def validate_phone(phone: str) -> Tuple[bool, str]:
 # ==================== ГЕНЕРАТОРИ ТЕКСТУ ====================
 
 def get_welcome_text() -> str:
-    """Повертає текст привітання"""
     return """
 <b>🇺🇦 Вітаємо у боті ферми "Смак природи"! 🌱</b>
 
@@ -845,7 +856,6 @@ def get_welcome_text() -> str:
     """
 
 def get_company_text() -> str:
-    """Повертає текст про компанію"""
     text = f"""
 <b>{COMPANY_INFO['name']}</b>
 
@@ -865,7 +875,7 @@ def get_company_text() -> str:
     return text
 
 def get_product_text(product_id: int) -> str:
-    """Повертає текст продукту"""
+    """Текст продукту"""
     product = next((p for p in PRODUCTS if p["id"] == product_id), None)
     if not product:
         return "❌ Продукт не знайдено"
@@ -892,7 +902,7 @@ def get_product_text(product_id: int) -> str:
     """
 
 def get_quick_order_text(product_id: int) -> str:
-    """Повертає текст для швидкого замовлення"""
+    """Текст швидкого замовлення"""
     product = next((p for p in PRODUCTS if p["id"] == product_id), None)
     if not product:
         return "❌ Продукт не знайдено"
@@ -909,7 +919,7 @@ def get_quick_order_text(product_id: int) -> str:
     """
 
 def get_faq_text(faq_id: int) -> str:
-    """Повертає текст FAQ"""
+    """Текст FAQ"""
     if 0 <= faq_id - 1 < len(FAQS):
         faq = FAQS[faq_id - 1]
         return f"""
@@ -922,7 +932,6 @@ def get_faq_text(faq_id: int) -> str:
     return "❌ Питання не знайдено"
 
 def get_contact_text() -> str:
-    """Повертає текст контактів"""
     return """
 <b>📞 Зв'язок з нами</b>
 
@@ -937,25 +946,8 @@ def get_contact_text() -> str:
 <i>Просто напишіть нам повідомлення в цьому чаті 👇</i>
     """
 
-def get_quick_message_text() -> str:
-    """Повертає текст для швидкого повідомлення"""
-    return """
-<b>💬 Написати нам повідомлення</b>
-
-Напишіть ваше повідомлення прямо в цьому чаті:
-
-• Питання про продукти
-• Консультація щодо замовлення
-• Пропозиції співпраці
-• Інші питання
-
-<b>Ми відповімо вам якнайшвидше! ⚡</b>
-
-<i>Просто напишіть ваше повідомлення нижче 👇</i>
-    """
-
 def get_cart_text(cart_items: List[Dict]) -> str:
-    """Повертає текст кошика"""
+    """Текст корзини"""
     if not cart_items:
         return "🛒 <b>Ваша корзина порожня</b>\n\nДодайте товари з каталогу!"
     
@@ -968,8 +960,8 @@ def get_cart_text(cart_items: List[Dict]) -> str:
         item_total = product["price"] * quantity
         
         text += f"<b>{i}. {product['name']}</b>\n"
-        text += f"   📊 Кількість: <b>{quantity} кг</b>\n"
-        text += f"   💰 Ціна: {product['price']} грн/кг × {quantity}кг = <b>{item_total:.2f} грн</b>\n\n"
+        text += f"   📊 Кількість: <b>{quantity} {product['unit']}</b>\n"
+        text += f"   💰 Ціна: {product['price']} грн/{product['unit']} × {quantity} = <b>{item_total:.2f} грн</b>\n\n"
         
         total += item_total
     
@@ -979,86 +971,86 @@ def get_cart_text(cart_items: List[Dict]) -> str:
     
     return text
 
-# ==================== ОСНОВНИЙ КЛАС БОТА (АСИНХРОННИЙ) ====================
+# ==================== ОСНОВНИЙ КЛАС БОТА ====================
 
 class FarmBot:
-    """Асинхронний основний клас бота ферми"""
-    
     def __init__(self):
         self.api = TelegramAPI(TOKEN)
         self.running = True
-        self.offset = 0
-    
+        self.error_count = 0
+        self.max_errors = 10
+        self.update_counter = 0
+        
     async def start(self):
-        """Асинхронний запуск бота"""
-        print("=" * 80)
-        print("🌱 БОТ ФЕРМИ 'СМАК ПРИРОДИ' ЗАПУЩЕНО (асинхронна версія)")
-        print(f"🔑 Токен: {TOKEN[:10]}...")
-        print("=" * 80)
+        """Запуск бота"""
+        logger.info("=" * 80)
+        logger.info("🌱 БОТ ФЕРМИ 'Смак природи' ЗАПУЩЕНО")
+        logger.info(f"🔑 Токен: {TOKEN[:10]}...")
+        logger.info("=" * 80)
         
         init_database()
         
         stats = Database.get_statistics()
-        print("📊 Статистика:")
-        print(f"• Користувачів: {stats['total_users']}")
-        print(f"• Замовлень: {stats['total_orders']}")
-        print(f"• Повідомлень: {stats['total_messages']}")
-        print(f"• Швидких замовлень: {stats['quick_orders']}")
-        print(f"• Активних кошиків: {stats['active_carts']}")
-        print(f"• Продуктів у базі: {len(PRODUCTS)}")
-        print("=" * 80)
-        print("🔄 Очікування повідомлень...\n")
+        logger.info("📊 Статистика:")
+        logger.info(f"• Користувачів: {stats.get('total_users', 0)}")
+        logger.info(f"• Замовлень: {stats.get('total_orders', 0)}")
+        logger.info(f"• Повідомлень: {stats.get('total_messages', 0)}")
+        logger.info(f"• Швидких замовлень: {stats.get('quick_orders', 0)}")
+        logger.info(f"• Активних кошиків: {stats.get('active_carts', 0)}")
+        logger.info(f"• Продуктів у базі: {len(PRODUCTS)}")
+        logger.info("=" * 80)
+        logger.info("🔄 Очікування повідомлень...\n")
         
-        update_counter = 0
-        error_counter = 0
-        
-        while self.running:
+        while self.running and self.error_count < self.max_errors:
             try:
-                updates = await self.api.get_updates(self.offset, timeout=30)
+                updates = await self.api.get_updates(timeout=30)
                 
                 if updates:
                     logger.info(f"📥 Получено обновлений: {len(updates)}")
-                    update_counter += len(updates)
-                
-                for update in updates:
-                    self.offset = update["update_id"] + 1
+                    self.update_counter += len(updates)
                     
-                    # Обробка в окремій задачі для швидкості
-                    asyncio.create_task(self.process_update(update))
+                    for update in updates:
+                        await self.process_update(update)
+                
+                # Сбрасываем счетчик ошибок при успешном получении
+                self.error_count = 0
+                
+                # Периодически выводим статистику
+                if self.update_counter % 10 == 0 and self.update_counter > 0:
+                    logger.info(f"📊 Всего обработано: {self.update_counter} обновлений")
                 
                 await asyncio.sleep(0.1)
                 
-                # Периодически выводим статистику
-                if update_counter % 10 == 0 and update_counter > 0:
-                    logger.info(f"📊 Всего обработано обновлений: {update_counter}")
-                    
             except KeyboardInterrupt:
-                print("\n🛑 Бот зупиняється...")
+                logger.info("\n🛑 Бот зупиняється...")
                 self.running = False
             except Exception as e:
-                error_counter += 1
-                logger.error(f"⚠️ Помилка в основному циклі ({error_counter}): {e}")
-                if error_counter > 10:
-                    logger.error("❌ Слишком много ошибок, перезапуск...")
-                    await asyncio.sleep(5)
-                    error_counter = 0
+                self.error_count += 1
+                logger.error(f"⚠️ Помилка в основному циклі ({self.error_count}/{self.max_errors}): {e}")
+                
+                if self.error_count >= self.max_errors:
+                    logger.error("❌ Слишком много ошибок. Перезапуск через 30 секунд...")
+                    await asyncio.sleep(30)
+                    self.error_count = 0
                 else:
                     await asyncio.sleep(1)
         
-        print(f"\n📊 ИТОГО: Обработано {update_counter} обновлений, ошибок: {error_counter}")
+        await self.api.close()
+        logger.info(f"\n📊 ИТОГО: Обработано {self.update_counter} обновлений, ошибок: {self.error_count}")
+        logger.info("👋 Бот остановлен")
     
     async def process_update(self, update: Dict):
-        """Обробляє оновлення в окремій задачі"""
+        """Обробляє оновлення"""
         try:
             if "message" in update:
                 await self.handle_message(update["message"])
             elif "callback_query" in update:
                 await self.handle_callback(update["callback_query"])
         except Exception as e:
-            logger.error(f"⚠️ Помилка обробки оновлення: {e}")
+            logger.error(f"❌ Помилка обробки оновлення: {e}")
     
     async def handle_message(self, message: Dict):
-        """Асинхронна обробка текстових повідомлень"""
+        """Обробляє повідомлення"""
         try:
             chat_id = message["chat"]["id"]
             user = message.get("from", {})
@@ -1075,7 +1067,7 @@ class FarmBot:
                 user.get("username", "")
             )
             
-            # ВАЖНО: /start и /cancel всегда сбрасывают состояние!
+            # Команди /start та /cancel
             if text == "/start" or text == "/cancel" or text.lower() == "скасувати":
                 Database.clear_user_session(user_id)
                 welcome = get_welcome_text()
@@ -1083,24 +1075,22 @@ class FarmBot:
                 Database.save_user_session(user_id, last_section="main_menu")
                 return
             
+            # Команда /help
+            if text == "/help":
+                await self.api.send_message(chat_id, "ℹ️ Допомога: оберіть опцію з меню", get_main_menu())
+                return
+            
             # Отримуємо стан користувача
             session = Database.get_user_session(user_id)
             state = session["state"]
             temp_data = session["temp_data"]
             
-            # Обробка інших команд
-            if text.startswith("/"):
-                if text == "/help":
-                    await self.api.send_message(chat_id, "ℹ️ Допомога: оберіть опцію з меню", get_main_menu())
-                else:
-                    await self.api.send_message(chat_id, "🤔 Невідома команда. Використовуйте /start для початку", get_main_menu())
-            
             # Обробка станів
-            elif state == "waiting_quantity":
+            if state == "waiting_quantity":
                 await self._handle_quantity_input(chat_id, user_id, user, text, temp_data)
             
-            elif state == "waiting_message" or state == "waiting_quick_message":
-                await self._handle_message_input(chat_id, user_id, user, text, state)
+            elif state == "waiting_message":
+                await self._handle_message_input(chat_id, user_id, user, text)
             
             elif state.startswith("full_order_"):
                 await self._handle_full_order_input(chat_id, user_id, user, text, state, temp_data)
@@ -1114,8 +1104,6 @@ class FarmBot:
                 
         except Exception as e:
             logger.error(f"❌ ОШИБКА В handle_message: {e}")
-            import traceback
-            traceback.print_exc()
     
     async def _handle_quantity_input(self, chat_id: int, user_id: int, user: Dict, text: str, temp_data: Dict):
         """Обробляє введення кількості"""
@@ -1133,9 +1121,9 @@ class FarmBot:
         if not success:
             response = f"❌ <b>Невірний формат!</b>\n\n{error_msg}\n\n"
             response += f"<b>Продукт:</b> {product['name']}\n"
-            response += f"<b>Ціна:</b> {product['price']} грн/кг\n\n"
-            response += "📊 <b>Введіть кількість в кг (тільки число):</b>\n"
-            response += "<i>Наприклад: 1.5 або 2</i>"
+            response += f"<b>Ціна:</b> {product['price']} грн/{product['unit']}\n\n"
+            response += "📊 <b>Введіть кількість (тільки число):</b>\n"
+            response += f"<i>Наприклад: 1, 1.5, 2.3 (в {product['unit']})</i>"
             
             await self.api.send_message(chat_id, response)
             return
@@ -1149,8 +1137,8 @@ class FarmBot:
         # Показуємо підтвердження
         total_price = product["price"] * quantity
         response = f"✅ <b>{product['name']}</b> додано до кошика!\n\n"
-        response += f"📊 Кількість: <b>{quantity} кг</b>\n"
-        response += f"💰 Ціна: {product['price']} грн/кг\n"
+        response += f"📊 Кількість: <b>{quantity} {product['unit']}</b>\n"
+        response += f"💰 Ціна: {product['price']} грн/{product['unit']}\n"
         response += f"💵 Сума: <b>{total_price:.2f} грн</b>\n\n"
         
         cart_items = Database.get_cart_items(user_id)
@@ -1164,18 +1152,25 @@ class FarmBot:
         await self.api.send_message(chat_id, products_text, get_products_menu())
         Database.save_user_session(user_id, last_section="products")
     
-    async def _handle_message_input(self, chat_id: int, user_id: int, user: Dict, text: str, state: str):
+    async def _handle_message_input(self, chat_id: int, user_id: int, user: Dict, text: str):
         """Обробляє введення повідомлення"""
         user_name = f"{user.get('first_name', '')} {user.get('last_name', '')}"
         username = user.get('username', 'немає')
         
-        # Определяем тип сообщения
-        message_type = "повідомлення з кнопки 'Написати нам тут'" if state == "waiting_message" else "швидке повідомлення"
-        
         # Зберігаємо повідомлення
-        Database.save_message(user_id, user_name, username, text, message_type)
+        Database.save_message(user_id, user_name, username, text, "повідомлення з меню")
         
-        # Відповідаємо користувачеві
+        # Логуємо
+        logger.info(f"\n{'='*80}")
+        logger.info(f"💬 НОВЕ ПОВІДОМЛЕННЯ:")
+        logger.info(f"👤 Ім'я: {user_name}")
+        logger.info(f"📱 Username: {username}")
+        logger.info(f"🆔 ID: {user_id}")
+        logger.info(f"💬 Текст: {text}")
+        logger.info(f"🕒 Час: {datetime.now().isoformat()}")
+        logger.info(f"{'='*80}\n")
+        
+        # Відповідаємо
         response = "✅ <b>Повідомлення отримано!</b>\n\n"
         response += "Ми відповімо вам найближчим часом.\n"
         response += "<i>Дякуємо за звернення! 🌱</i>"
@@ -1185,9 +1180,9 @@ class FarmBot:
         Database.save_user_session(user_id, last_section="main_menu")
     
     async def _handle_full_order_input(self, chat_id: int, user_id: int, user: Dict, text: str, state: str, temp_data: Dict):
-        """Обробляє введення для повного замовлення"""
+        """Обробляє введення для замовлення"""
         if state == "full_order_name":
-            temp_data["name"] = text
+            temp_data["user_name"] = text
             temp_data["username"] = user.get("username", "немає")
             Database.save_user_session(user_id, "full_order_phone", temp_data)
             
@@ -1219,28 +1214,41 @@ class FarmBot:
             temp_data["city"] = text
             Database.save_user_session(user_id, "full_order_np", temp_data)
             
-            response = "🏣 <b>Введіть номер відділення Нової Пошти або адресу:</b>\n\n"
-            response += "<i>Наприклад: Відділення №25 або вул. Садова, 10, кв. 5</i>"
+            # ИСПРАВЛЕНО: убрано "или адрес"
+            response = "🏣 <b>Введіть номер відділення Нової Пошти:</b>\n\n"
+            response += "<i>Наприклад: Відділення №25</i>"
             await self.api.send_message(chat_id, response)
         
         elif state == "full_order_np":
             temp_data["np_department"] = text
             
-            # Розраховуємо загальну суму
+            # Розраховуємо суму
             cart_items = Database.get_cart_items(user_id)
             total = sum(item["product"]["price"] * item["quantity"] for item in cart_items)
             temp_data["total"] = total
             temp_data["order_type"] = "повне замовлення"
+            temp_data["user_id"] = user_id
             
-            # Зберігаємо дані
+            # Підготовлюємо товари
+            order_items = []
+            for item in cart_items:
+                order_items.append({
+                    "product_name": item["product"]["name"],
+                    "quantity": item["quantity"],
+                    "price": item["product"]["price"]
+                })
+            
+            temp_data["items"] = order_items
+            
+            # Зберігаємо
             Database.save_user_session(user_id, "full_order_confirm", temp_data)
             
             # Показуємо підтвердження
             response = "✅ <b>Дані отримано! Перевірте інформацію:</b>\n\n"
-            response += f"👤 <b>ПІБ:</b> {temp_data.get('name', '')}\n"
+            response += f"👤 <b>ПІБ:</b> {temp_data.get('user_name', '')}\n"
             response += f"📱 <b>Телефон:</b> {temp_data.get('phone', '')}\n"
             response += f"🏙️ <b>Місто:</b> {temp_data.get('city', '')}\n"
-            response += f"🏣 <b>Адреса/Відділення:</b> {text}\n"
+            response += f"🏣 <b>Відділення Нової Пошти:</b> {text}\n"
             response += f"🛒 <b>Товарів у кошику:</b> {len(cart_items)}\n"
             response += f"💰 <b>Загальна сума:</b> {total:.2f} грн\n\n"
             response += "<b>Підтвердити замовлення?</b>"
@@ -1248,10 +1256,9 @@ class FarmBot:
             await self.api.send_message(chat_id, response, get_order_confirmation_keyboard())
     
     async def _handle_quick_order_phone(self, chat_id: int, user_id: int, user: Dict, text: str, temp_data: Dict):
-        """Обробляє введення телефону для швидкого замовлення"""
+        """Обробляє телефон для швидкого замовлення"""
         phone = text.strip()
         product_id = temp_data.get("product_id")
-        quantity = temp_data.get("quantity")
         
         product = next((p for p in PRODUCTS if p["id"] == product_id), None)
         if not product:
@@ -1259,7 +1266,7 @@ class FarmBot:
             Database.clear_user_session(user_id)
             return
         
-        # Валідація телефону
+        # Валідація
         is_valid, formatted_phone = validate_phone(phone)
         
         if not is_valid:
@@ -1276,34 +1283,28 @@ class FarmBot:
         
         order_id = Database.save_quick_order(
             user_id, user_name, username, product_id, product["name"], 
-            quantity, formatted_phone, "call"
+            0, formatted_phone, "call"
         )
         
-        # Логуємо в консоль
-        total_price = product["price"] * quantity
+        # Логуємо
         logger.info(f"\n{'='*80}")
         logger.info(f"⚡ ШВИДКЕ ЗАМОВЛЕННЯ #{order_id} (ТЕЛЕФОН):")
         logger.info(f"👤 Клієнт: {user_name}")
         logger.info(f"📞 Телефон: {formatted_phone}")
         logger.info(f"📦 Продукт: {product['name']}")
-        logger.info(f"📊 Кількість: {quantity} кг")
-        logger.info(f"💰 Ціна: {product['price']} грн/кг")
-        logger.info(f"💵 Сума: {total_price:.2f} грн")
         logger.info(f"🆔 User ID: {user_id}")
-        logger.info(f"📱 Username: @{username}" if username != 'немає' else "📱 Username: немає")
+        logger.info(f"📱 Username: {username}")
         logger.info(f"{'='*80}\n")
         
         # Очищаємо сесію
         Database.clear_user_session(user_id)
         
-        # Відповідаємо користувачеві
+        # Відповідаємо
         response = f"✅ <b>Швидке замовлення прийнято!</b>\n\n"
         response += f"🆔 <b>Номер замовлення:</b> #{order_id}\n"
         response += f"📦 <b>Продукт:</b> {product['name']}\n"
-        response += f"📊 <b>Кількість:</b> {quantity} кг\n"
-        response += f"💰 <b>Сума:</b> {total_price:.2f} грн\n"
         response += f"📞 <b>Ваш телефон:</b> {formatted_phone}\n\n"
-        response += "<b>Ми зателефонуємо вам найближчим часом для підтвердження!</b>\n\n"
+        response += "<b>Ми зателефонуємо вам найближчим часом для уточнення деталей!</b>\n\n"
         response += "<i>Дякуємо за замовлення! 🌱</i>"
         
         await self.api.send_message(chat_id, response, get_main_menu())
@@ -1326,95 +1327,101 @@ class FarmBot:
         Database.save_user_session(user_id, last_section="main_menu")
     
     async def handle_callback(self, callback: Dict):
-        """Асинхронна обробка натискання кнопок"""
-        callback_id = callback["id"]
-        message = callback["message"]
-        chat_id = message["chat"]["id"]
-        message_id = message["message_id"]
-        data = callback["data"]
-        user = callback["from"]
-        user_id = user["id"]
-        
-        logger.info(f"🖱️ [{datetime.now().strftime('%H:%M:%S')}] {user.get('first_name', 'Користувач')} натиснув: {data}")
-        
-        # Зберігаємо користувача
-        Database.save_user(
-            user_id,
-            user.get("first_name", ""),
-            user.get("last_name", ""),
-            user.get("username", "")
-        )
-        
-        # Відповідаємо на callback
-        await self.api.answer_callback(callback_id)
-        
-        # Обробка кнопок "Назад"
-        if data.startswith("back_"):
-            await self._handle_back_button(chat_id, message_id, user_id, data)
-        
-        # Головне меню
-        elif data == "company":
-            await self._handle_company(chat_id, message_id, user_id)
-        
-        elif data == "products":
-            await self._handle_products(chat_id, message_id, user_id)
-        
-        elif data.startswith("product_"):
-            await self._handle_product_detail(chat_id, message_id, user_id, data)
-        
-        elif data.startswith("add_to_cart_"):
-            await self._handle_add_to_cart(chat_id, message_id, user_id, data)
-        
-        elif data.startswith("quick_order_"):
-            await self._handle_quick_order(chat_id, message_id, user_id, data)
-        
-        elif data.startswith("quick_call_"):
-            await self._handle_quick_call(chat_id, message_id, user_id, data)
-        
-        elif data.startswith("quick_chat_"):
-            await self._handle_quick_chat(chat_id, message_id, user_id, data)
-        
-        elif data == "faq":
-            await self._handle_faq(chat_id, message_id, user_id)
-        
-        elif data.startswith("faq_"):
-            await self._handle_faq_detail(chat_id, message_id, user_id, data)
-        
-        elif data == "quick_message":
-            await self._handle_quick_message(chat_id, message_id, user_id)
-        
-        elif data == "write_quick_message":
-            await self._handle_write_quick_message(chat_id, message_id, user_id)
-        
-        elif data == "cart":
-            await self._handle_cart(chat_id, message_id, user_id)
-        
-        elif data.startswith("remove_from_cart_"):
-            await self._handle_remove_from_cart(chat_id, message_id, user_id, data)
-        
-        elif data == "checkout_cart":
-            await self._handle_checkout_cart(chat_id, message_id, user_id)
-        
-        elif data == "clear_cart":
-            await self._handle_clear_cart(chat_id, message_id, user_id)
-        
-        elif data == "my_orders":
-            await self._handle_my_orders(chat_id, message_id, user_id)
-        
-        elif data == "contact":
-            await self._handle_contact(chat_id, message_id, user_id)
-        
-        elif data == "write_here":
-            await self._handle_write_here(chat_id, message_id, user_id)
-        
-        elif data in ["call_us", "email_us", "our_address"]:
-            await self._handle_contact_info(chat_id, message_id, user_id, data)
-        
-        elif data.startswith("confirm_order_"):
-            await self._handle_order_confirmation(chat_id, message_id, user_id, data)
-        
-        else:
-            await self._handle_unknown_callback(chat_id, message_id, user_id, data)
+        """Обробляє callback"""
+        try:
+            callback_id = callback["id"]
+            message = callback["message"]
+            chat_id = message["chat"]["id"]
+            message_id = message["message_id"]
+            data = callback["data"]
+            user = callback["from"]
+            user_id = user["id"]
+            
+            logger.info(f"🖱️ [{datetime.now().strftime('%H:%M:%S')}] {user.get('first_name', 'Користувач')} натиснув: {data}")
+            
+            # Зберігаємо користувача
+            Database.save_user(
+                user_id,
+                user.get("first_name", ""),
+                user.get("last_name", ""),
+                user.get("username", "")
+            )
+            
+            # Відповідаємо на callback
+            await self.api.answer_callback(callback_id)
+            
+            # Обробка кнопок "Назад"
+            if data.startswith("back_"):
+                await self._handle_back_button(chat_id, message_id, user_id, data)
+            
+            # Головне меню
+            elif data == "company":
+                await self._handle_company(chat_id, message_id, user_id)
+            
+            elif data == "products":
+                await self._handle_products(chat_id, message_id, user_id)
+            
+            elif data.startswith("product_"):
+                await self._handle_product_detail(chat_id, message_id, user_id, data)
+            
+            elif data.startswith("add_to_cart_"):
+                await self._handle_add_to_cart(chat_id, message_id, user_id, data)
+            
+            elif data.startswith("quick_order_"):
+                await self._handle_quick_order(chat_id, message_id, user_id, data)
+            
+            elif data.startswith("quick_call_"):
+                await self._handle_quick_call(chat_id, message_id, user_id, data)
+            
+            elif data.startswith("quick_chat_"):
+                await self._handle_quick_chat(chat_id, message_id, user_id, data)
+            
+            elif data == "faq":
+                await self._handle_faq(chat_id, message_id, user_id)
+            
+            elif data.startswith("faq_"):
+                await self._handle_faq_detail(chat_id, message_id, user_id, data)
+            
+            elif data == "cart":
+                await self._handle_cart(chat_id, message_id, user_id)
+            
+            elif data.startswith("remove_from_cart_"):
+                await self._handle_remove_from_cart(chat_id, message_id, user_id, data)
+            
+            elif data == "checkout_cart":
+                await self._handle_checkout_cart(chat_id, message_id, user_id)
+            
+            elif data == "clear_cart":
+                await self._handle_clear_cart(chat_id, message_id, user_id)
+            
+            elif data == "my_orders":
+                await self._handle_my_orders(chat_id, message_id, user_id)
+            
+            elif data == "contact":
+                await self._handle_contact(chat_id, message_id, user_id)
+            
+            elif data == "write_here":
+                await self._handle_write_here(chat_id, message_id, user_id)
+            
+            elif data in ["call_us", "email_us", "our_address"]:
+                await self._handle_contact_info(chat_id, message_id, user_id, data)
+            
+            elif data.startswith("confirm_order_"):
+                await self._handle_order_confirmation(chat_id, message_id, user_id, data)
+            
+            else:
+                await self._handle_unknown_callback(chat_id, message_id, user_id, data)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки callback: {e}")
+            # При ошибке показываем главное меню
+            try:
+                text = "❌ <b>Сталася помилка</b>\n\n"
+                text += "Будь ласка, спробуйте ще раз або використайте /start"
+                keyboard = get_main_menu()
+                await self.api.edit_message(chat_id, message_id, text, keyboard)
+            except:
+                pass
     
     async def _handle_back_button(self, chat_id: int, message_id: int, user_id: int, data: str):
         """Обробляє кнопку 'Назад'"""
@@ -1439,11 +1446,6 @@ class FarmBot:
             contact_text = get_contact_text()
             await self.api.edit_message(chat_id, message_id, contact_text, get_contact_menu())
             Database.save_user_session(user_id, last_section="contact")
-        
-        elif back_target == "quick_message":
-            quick_message_text = get_quick_message_text()
-            await self.api.edit_message(chat_id, message_id, quick_message_text, get_quick_message_menu())
-            Database.save_user_session(user_id, last_section="quick_message")
         
         elif back_target == "cart":
             await self._handle_cart(chat_id, message_id, user_id)
@@ -1485,7 +1487,7 @@ class FarmBot:
                 await self.api.edit_message(chat_id, message_id, "❌ Продукт не знайдено", get_back_keyboard("products"))
                 return
             
-            # Зберігаємо сесію з ID товару
+            # Зберігаємо сесію
             temp_data = {"product_id": product_id}
             Database.save_user_session(user_id, "waiting_quantity", temp_data)
             
@@ -1494,9 +1496,9 @@ class FarmBot:
             
             # Запитуємо кількість
             response = f"📦 <b>Додавання {product['name']} до кошика</b>\n\n"
-            response += f"💰 Ціна: {product['price']} грн/кг\n\n"
-            response += "📊 <b>Введіть кількість в кг (тільки число):</b>\n\n"
-            response += "<i>Наприклад: 1.5 або 2</i>"
+            response += f"💰 Ціна: {product['price']} грн/{product['unit']}\n\n"
+            response += "📊 <b>Введіть кількість (тільки число):</b>\n\n"
+            response += f"<i>Наприклад: 1, 1.5, 2.3 (в {product['unit']})</i>"
             
             await self.api.send_message(chat_id, response)
             
@@ -1504,7 +1506,7 @@ class FarmBot:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка додавання до кошика", get_back_keyboard("products"))
     
     async def _handle_quick_order(self, chat_id: int, message_id: int, user_id: int, data: str):
-        """Обробляє кнопку швидкого замовлення"""
+        """Обробляє швидке замовлення"""
         try:
             product_id = int(data.split("_")[2])
             product = next((p for p in PRODUCTS if p["id"] == product_id), None)
@@ -1513,26 +1515,15 @@ class FarmBot:
                 await self.api.edit_message(chat_id, message_id, "❌ Продукт не знайдено", get_back_keyboard("products"))
                 return
             
-            # Зберігаємо сесію з ID товару для швидкого замовлення
-            temp_data = {"product_id": product_id}
-            Database.save_user_session(user_id, "waiting_quantity_quick", temp_data)
-            
-            # Видаляємо повідомлення з кнопками
-            await self.api.delete_message(chat_id, message_id)
-            
-            # Запитуємо кількість
-            response = f"⚡ <b>Швидке замовлення: {product['name']}</b>\n\n"
-            response += f"💰 Ціна: {product['price']} грн/кг\n\n"
-            response += "📊 <b>Введіть кількість в кг (тільки число):</b>\n\n"
-            response += "<i>Наприклад: 1.5 або 2</i>"
-            
-            await self.api.send_message(chat_id, response)
+            # Показуємо меню вибору способу зв'язку (без запиту кількості)
+            quick_order_text = get_quick_order_text(product_id)
+            await self.api.edit_message(chat_id, message_id, quick_order_text, get_quick_order_menu(product_id))
             
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка швидкого замовлення", get_back_keyboard("products"))
     
     async def _handle_quick_call(self, chat_id: int, message_id: int, user_id: int, data: str):
-        """Обробляє вибір телефонного зв'язку для швидкого замовлення"""
+        """Обробляє вибір телефону для швидкого замовлення"""
         try:
             product_id = int(data.split("_")[2])
             product = next((p for p in PRODUCTS if p["id"] == product_id), None)
@@ -1541,40 +1532,21 @@ class FarmBot:
                 await self.api.edit_message(chat_id, message_id, "❌ Продукт не знайдено", get_back_keyboard("products"))
                 return
             
-            # Отримуємо кількість з сесії
-            session = Database.get_user_session(user_id)
-            temp_data = session["temp_data"]
-            quantity = temp_data.get("quantity")
+            # Зберігаємо сесію для запиту телефона
+            temp_data = {"product_id": product_id}
+            Database.save_user_session(user_id, "waiting_phone_for_quick_order", temp_data)
             
-            if not quantity:
-                # Запитуємо кількість
-                temp_data = {"product_id": product_id}
-                Database.save_user_session(user_id, "waiting_quantity_for_call", temp_data)
-                
-                # Видаляємо повідомлення з кнопками
-                await self.api.delete_message(chat_id, message_id)
-                
-                response = f"📞 <b>Зателефонуйте мені: {product['name']}</b>\n\n"
-                response += f"💰 Ціна: {product['price']} грн/кг\n\n"
-                response += "📊 <b>Введіть кількість в кг (тільки число):</b>\n\n"
-                response += "<i>Наприклад: 1.5 або 2</i>"
-                
-                await self.api.send_message(chat_id, response)
-            else:
-                # Запитуємо телефон
-                temp_data = {"product_id": product_id, "quantity": quantity}
-                Database.save_user_session(user_id, "waiting_phone_for_quick_order", temp_data)
-                
-                # Видаляємо повідомлення з кнопками
-                await self.api.delete_message(chat_id, message_id)
-                
-                response = f"📞 <b>Зателефонуйте мені: {product['name']}</b>\n\n"
-                response += f"📊 Кількість: {quantity} кг\n"
-                response += f"💰 Сума: {product['price'] * quantity:.2f} грн\n\n"
-                response += "📱 <b>Введіть ваш номер телефону:</b>\n\n"
-                response += "<i>Приклад: +380501234567 або 0501234567</i>"
-                
-                await self.api.send_message(chat_id, response)
+            # Видаляємо повідомлення
+            await self.api.delete_message(chat_id, message_id)
+            
+            # Запитуємо телефон
+            response = f"📞 <b>Зателефонуйте мені: {product['name']}</b>\n\n"
+            response += f"💰 Ціна: {product['price']} грн/{product['unit']}\n\n"
+            response += "📱 <b>Введіть ваш номер телефону:</b>\n\n"
+            response += "<i>Приклад: +380501234567 або 0501234567</i>\n\n"
+            response += "<b>Ми зателефонуємо вам для уточнення деталей замовлення!</b>"
+            
+            await self.api.send_message(chat_id, response)
             
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка швидкого замовлення", get_back_keyboard("products"))
@@ -1589,70 +1561,34 @@ class FarmBot:
                 await self.api.edit_message(chat_id, message_id, "❌ Продукт не знайдено", get_back_keyboard("products"))
                 return
             
-            # Отримуємо кількість з сесії
-            session = Database.get_user_session(user_id)
-            temp_data = session["temp_data"]
-            quantity = temp_data.get("quantity")
+            # Видаляємо повідомлення
+            await self.api.delete_message(chat_id, message_id)
             
-            if not quantity:
-                # Запитуємо кількість
-                temp_data = {"product_id": product_id}
-                Database.save_user_session(user_id, "waiting_quantity_for_chat", temp_data)
-                
-                # Видаляємо повідомлення з кнопками
-                await self.api.delete_message(chat_id, message_id)
-                
-                response = f"💬 <b>Напишіть мені в чат: {product['name']}</b>\n\n"
-                response += f"💰 Ціна: {product['price']} грн/кг\n\n"
-                response += "📊 <b>Введіть кількість в кг (тільки число):</b>\n\n"
-                response += "<i>Наприклад: 1.5 або 2</i>"
-                
-                await self.api.send_message(chat_id, response)
-            else:
-                # Зберігаємо швидке замовлення з типом "чат"
-                user = Database.get_connection().execute('SELECT first_name, last_name, username FROM users WHERE user_id = ?', (user_id,)).fetchone()
-                if user:
-                    first_name, last_name, username = user
-                    user_name = f"{first_name} {last_name}" if last_name else first_name
-                    username = username or 'немає'
-                    
-                    # Зберігаємо швидке замовлення
-                    order_id = Database.save_quick_order(
-                        user_id, user_name, username, product_id, product["name"], 
-                        quantity, None, "chat"
-                    )
-                    
-                    # Логуємо в консоль
-                    total_price = product["price"] * quantity
-                    logger.info(f"\n{'='*80}")
-                    logger.info(f"⚡ ШВИДКЕ ЗАМОВЛЕННЯ #{order_id} (ЧАТ):")
-                    logger.info(f"👤 Клієнт: {user_name}")
-                    logger.info(f"📦 Продукт: {product['name']}")
-                    logger.info(f"📊 Кількість: {quantity} кг")
-                    logger.info(f"💰 Ціна: {product['price']} грн/кг")
-                    logger.info(f"💵 Сума: {total_price:.2f} грн")
-                    logger.info(f"🆔 User ID: {user_id}")
-                    logger.info(f"📱 Username: @{username}" if username != 'немає' else "📱 Username: немає")
-                    logger.info(f"💬 Контакт: Чат Telegram")
-                    logger.info(f"{'='*80}\n")
-                
-                # Видаляємо повідомлення з кнопками
-                await self.api.delete_message(chat_id, message_id)
-                
-                response = f"✅ <b>Швидке замовлення прийнято!</b>\n\n"
-                response += f"📦 <b>Продукт:</b> {product['name']}\n"
-                response += f"📊 <b>Кількість:</b> {quantity} кг\n"
-                response += f"💰 <b>Сума:</b> {product['price'] * quantity:.2f} грн\n\n"
-                response += "💬 <b>Напишіть ваше повідомлення прямо в цьому чаті:</b>\n\n"
-                response += "• Ваші контактні дані\n"
-                response += "• Бажаний час доставки\n"
-                response += "• Додаткові побажання\n\n"
-                response += "<b>Ми відповімо вам найближчим часом!</b>\n\n"
-                response += "<i>Дякуємо за замовлення! 🌱</i>"
-                
-                await self.api.send_message(chat_id, response)
-                Database.clear_user_session(user_id)
-                Database.save_user_session(user_id, last_section="main_menu")
+            response = f"💬 <b>Напишіть мені в чат: {product['name']}</b>\n\n"
+            response += f"💰 Ціна: {product['price']} грн/{product['unit']}\n\n"
+            response += "💬 <b>Просто напишіть ваше повідомлення в цей чат!</b>\n\n"
+            response += "Вкажіть:\n"
+            response += "• Бажану кількість\n"
+            response += "• Контактні дані\n"
+            response += "• Бажаний час доставки\n\n"
+            response += "<b>Ми відповімо вам найближчим часом для уточнення деталей замовлення!</b>"
+            
+            await self.api.send_message(chat_id, response)
+            
+            # Логуємо в консоль
+            user = Database.get_user_session(user_id)
+            user_name = f"User_{user_id}"
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"⚡ ШВИДКЕ ЗАМОВЛЕННЯ (ЧАТ):")
+            logger.info(f"👤 Клієнт: {user_name}")
+            logger.info(f"📦 Продукт: {product['name']}")
+            logger.info(f"💰 Ціна: {product['price']} грн/{product['unit']}")
+            logger.info(f"🆔 User ID: {user_id}")
+            logger.info(f"💬 Контакт: Чат Telegram")
+            logger.info(f"{'='*80}\n")
+            
+            Database.clear_user_session(user_id)
             
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка швидкого замовлення", get_back_keyboard("products"))
@@ -1671,30 +1607,6 @@ class FarmBot:
             await self.api.edit_message(chat_id, message_id, faq_text, get_back_keyboard("faq"))
         except:
             await self.api.edit_message(chat_id, message_id, "❌ Помилка завантаження питання", get_back_keyboard("faq"))
-    
-    async def _handle_quick_message(self, chat_id: int, message_id: int, user_id: int):
-        """Обробляє кнопку 'Написати нам'"""
-        quick_message_text = get_quick_message_text()
-        await self.api.edit_message(chat_id, message_id, quick_message_text, get_quick_message_menu())
-        Database.save_user_session(user_id, last_section="quick_message")
-    
-    async def _handle_write_quick_message(self, chat_id: int, message_id: int, user_id: int):
-        """Обробляє кнопку 'Написати повідомлення' для швидкого замовлення"""
-        Database.save_user_session(user_id, "waiting_quick_message")
-        
-        # Видаляємо повідомлення
-        await self.api.delete_message(chat_id, message_id)
-        
-        response = "💬 <b>Написати нам повідомлення</b>\n\n"
-        response += "Напишіть ваше повідомлення прямо в цьому чаті:\n\n"
-        response += "• Питання про продукти\n"
-        response += "• Консультація щодо замовлення\n"
-        response += "• Пропозиції співпраці\n"
-        response += "• Інші питання\n\n"
-        response += "<b>Ми відповімо вам якнайшвидше! ⚡</b>\n\n"
-        response += "<i>Просто напишіть ваше повідомлення нижче 👇</i>"
-        
-        await self.api.send_message(chat_id, response)
     
     async def _handle_cart(self, chat_id: int, message_id: int, user_id: int):
         """Обробляє кнопку 'Моя корзина'"""
@@ -1757,28 +1669,11 @@ class FarmBot:
     
     async def _handle_my_orders(self, chat_id: int, message_id: int, user_id: int):
         """Обробляє кнопку 'Мої замовлення'"""
-        orders = Database.get_user_orders(user_id)
+        text = "📋 <b>Мої замовлення</b>\n\n"
+        text += "Функція перегляду замовлень знаходиться в розробці.\n"
+        text += "<i>Зв'яжіться з нами для отримання інформації про ваші замовлення.</i>"
         
-        if orders:
-            orders_text = "📋 <b>Ваші замовлення</b>\n\n"
-            for order in orders[:5]:
-                orders_text += f"🆔 <b>#{order['order_id']}</b>\n"
-                orders_text += f"   📦 Тип: {order['order_type']}\n"
-                orders_text += f"   🛒 Товари: {order['products'] or 'не вказано'}\n"
-                orders_text += f"   💰 Сума: {order['total']:.2f} грн\n"
-                orders_text += f"   📊 Статус: {order['status']}\n"
-                orders_text += f"   🕒 {order['created_at'][:10]}\n\n"
-            
-            if len(orders) > 5:
-                orders_text += f"<i>Показано останні 5 з {len(orders)} замовлень</i>\n"
-            
-            orders_text += "\n📞 <b>Питання щодо замовлення?</b>\nНапишіть нам у чат!"
-        else:
-            orders_text = "📋 <b>Ваші замовлення</b>\n\n"
-            orders_text += "У вас ще немає замовлень.\n"
-            orders_text += "Оберіть продукти та зробіть своє перше замовлення! 🚀"
-        
-        await self.api.edit_message(chat_id, message_id, orders_text, get_back_keyboard("main_menu"))
+        await self.api.edit_message(chat_id, message_id, text, get_back_keyboard("main_menu"))
         Database.save_user_session(user_id, last_section="my_orders")
     
     async def _handle_contact(self, chat_id: int, message_id: int, user_id: int):
@@ -1830,33 +1725,61 @@ class FarmBot:
     async def _handle_order_confirmation(self, chat_id: int, message_id: int, user_id: int, data: str):
         """Обробляє підтвердження замовлення"""
         if data == "confirm_order_yes":
-            # Отримуємо дані
+            # Получаем данные
             session = Database.get_user_session(user_id)
             temp_data = session["temp_data"]
             
-            # Створюємо замовлення
-            order_id = Database.create_order(user_id, temp_data)
-            
-            # Очищаємо сесію
-            Database.clear_user_session(user_id)
-            
-            # Надсилаємо підтвердження
-            response = "✅ <b>Замовлення оформлено!</b>\n\n"
-            response += f"🆔 Номер замовлення: <b>#{order_id}</b>\n"
-            response += f"👤 ПІБ: <b>{temp_data.get('name', '')}</b>\n"
-            response += f"📱 Телефон: <b>{temp_data.get('phone', '')}</b>\n"
-            response += f"🏙️ Місто: <b>{temp_data.get('city', '')}</b>\n"
-            response += f"🏣 Адреса: <b>{temp_data.get('np_department', '')}</b>\n"
-            response += f"💰 Сума: <b>{temp_data.get('total', 0):.2f} грн</b>\n\n"
-            response += "📞 <b>Ми зв'яжемось з вами для підтвердження!</b>\n\n"
-            response += "<i>Дякуємо за замовлення! 🌱</i>"
+            # ИСПРАВЛЕНО: использование транзакций для избежания блокировок
+            try:
+                # Создаем заказ
+                order_id = Database.create_order(temp_data)
+                
+                if order_id > 0:
+                    # Логируем
+                    logger.info(f"\n{'='*80}")
+                    logger.info(f"✅ НОВЫЙ ЗАКАЗ #{order_id}:")
+                    logger.info(f"👤 Клиент: {temp_data.get('user_name', '')}")
+                    logger.info(f"📞 Телефон: {temp_data.get('phone', '')}")
+                    logger.info(f"🏙️ Город: {temp_data.get('city', '')}")
+                    logger.info(f"🏣 НП: {temp_data.get('np_department', '')}")
+                    logger.info(f"💰 Сумма: {temp_data.get('total', 0):.2f} грн")
+                    logger.info(f"🛒 Товаров: {len(temp_data.get('items', []))}")
+                    logger.info(f"🆔 User ID: {user_id}")
+                    logger.info(f"{'='*80}\n")
+                    
+                    # Очищаем сессию
+                    Database.clear_user_session(user_id)
+                    
+                    # Отправляем подтверждение
+                    text = f"✅ <b>Замовлення оформлено!</b>\n\n"
+                    text += f"🆔 Номер замовлення: <b>#{order_id}</b>\n"
+                    text += f"👤 ПІБ: <b>{temp_data.get('user_name', '')}</b>\n"
+                    text += f"📱 Телефон: <b>{temp_data.get('phone', '')}</b>\n"
+                    text += f"🏙️ Місто: <b>{temp_data.get('city', '')}</b>\n"
+                    text += f"🏣 Відділення Нової Пошти: <b>{temp_data.get('np_department', '')}</b>\n"
+                    text += f"💰 Сума: <b>{temp_data.get('total', 0):.2f} грн</b>\n\n"
+                    text += "📞 <b>Ми зв'яжемось з вами для підтвердження!</b>\n\n"
+                    text += "<i>Дякуємо за замовлення! 🌱</i>"
+                else:
+                    text = "❌ <b>Помилка оформлення замовлення!</b>\n\n"
+                    text += "Будь ласка, спробуйте ще раз або зв'яжіться з нами.\n\n"
+                    text += "<i>Вибачте за незручності.</i>"
+                    Database.clear_user_session(user_id)
+            except Exception as e:
+                logger.error(f"❌ Ошибка при создании заказа: {e}")
+                text = "❌ <b>Помилка оформлення замовлення!</b>\n\n"
+                text += "Будь ласка, спробуйте ще раз.\n\n"
+                text += "<i>Вибачте за незручності.</i>"
+                Database.clear_user_session(user_id)
             
         else:
-            response = "❌ <b>Замовлення скасовано</b>\n\n"
-            response += "Ви можете продовжити покупки.\n"
+            text = "❌ <b>Замовлення скасовано</b>\n\n"
+            text += "Ви можете продовжити покупки.\n"
+            text += "<i>Ваша корзина збережена.</i>"
             Database.clear_user_session(user_id)
         
-        await self.api.edit_message(chat_id, message_id, response, get_main_menu())
+        keyboard = get_main_menu()
+        await self.api.edit_message(chat_id, message_id, text, keyboard)
         Database.save_user_session(user_id, last_section="main_menu")
     
     async def _handle_unknown_callback(self, chat_id: int, message_id: int, user_id: int, data: str):
@@ -1866,61 +1789,96 @@ class FarmBot:
         await self.api.edit_message(chat_id, message_id, welcome, get_main_menu())
         Database.save_user_session(user_id, last_section="main_menu")
 
-# ==================== FLASK СЕРВЕР ДЛЯ RENDER ====================
+# ==================== FLASK СЕРВЕР ====================
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
 
 @app.route('/')
 def home():
-    return "🌱 Бот фермы 'Смак природи' працює! 🚀"
+    return """
+    <!DOCTYPE html>
+
+@app.route('/')
+def home():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🌱 Бот ферми "Смак природи"</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #2e7d32;
+            }
+            .status {
+                padding: 10px;
+                background: #e8f5e9;
+                border-radius: 5px;
+                margin: 20px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🌱 Бот ферми "Смак природи"</h1>
+            <div class="status">
+                <h3>✅ Бот работает и готов к приему сообщений!</h3>
+                <p>Бот успешно запущен и подключен к Telegram API.</p>
+            </div>
+            <p><a href="/health">Проверить статус (health check)</a></p>
+            <p><a href="/ping">Пинг сервера</a></p>
+        </div>
+    </body>
+    </html>
+    """
 
 @app.route('/health')
 def health():
     return "OK", 200
 
-def run_flask():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@app.route('/ping')
+def ping():
+    return "pong", 200
 
-# ==================== ОБРАБОТКА КОЛИЧЕСТВА ДЛЯ ШВИДКИХ ЗАКАЗОВ ====================
+# ==================== ЗАПУСК ====================
 
-async def main_async():
-    """Асинхронна головна функція"""
-    print("🌱 Завантаження бота ферми 'Смак природи'...")
-    
-    # Запускаем Flask сервер для Render
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print(f"✅ Flask сервер запущено на порті 8080")
-    
-    # Ініціалізація бази даних
-    init_database()
-    print("✅ База даних ініціалізована")
-    
-    # Створюємо та запускаємо бота
+async def main():
+    """Головна функція"""
     bot = FarmBot()
     
     try:
         await bot.start()
     except KeyboardInterrupt:
-        print("\n\n🛑 Бот зупинено користувачем")
+        logger.info("\n🛑 Бот зупинено користувачем")
     except Exception as e:
-        print(f"\n\n❌ Критична помилка: {e}")
-    
-    # Виводимо статистику
-    print("\n" + "=" * 80)
-    print("📊 ФІНАЛЬНА СТАТИСТИКА:")
-    stats = Database.get_statistics()
-    print(f"• Замовлень: {stats['total_orders']}")
-    print(f"• Швидких замовлень: {stats['quick_orders']}")
-    print(f"• Повідомлень: {stats['total_messages']}")
-    print(f"• Користувачів: {stats['total_users']}")
-    print("=" * 80)
-    print("👋 До побачення!")
+        logger.error(f"❌ Критична помилка: {e}")
+    finally:
+        if hasattr(bot, 'api'):
+            await bot.api.close()
 
-def main():
-    """Синхронна обгортка для запуску"""
-    asyncio.run(main_async())
+def run_flask():
+    """Запуск Flask сервера"""
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    main()
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"✅ Flask сервер запущено на порті {os.environ.get('PORT', 8080)}")
+    
+    # Запускаем бота
+    asyncio.run(main())
+    
