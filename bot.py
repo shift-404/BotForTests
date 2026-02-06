@@ -1,6 +1,5 @@
 """
-БОТ ФЕРМИ "СМАК ПРИРОДИ" - ПОЛНАЯ ВЕРСИЯ ДЛЯ RENDER
-Со всеми функциями, вебхуками и исправленными фотографиями
+БОТ ФЕРМИ "СМАК ПРИРОДИ" - ПОЛНЫЙ КОД ДЛЯ python-telegram-bot 20.7
 """
 
 import os
@@ -8,11 +7,8 @@ import json
 import sqlite3
 import re
 import logging
-import asyncio
-import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -21,7 +17,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler
+    CallbackContext
 )
 
 # ==================== НАСТРОЙКА ====================
@@ -37,14 +33,6 @@ if not TOKEN:
     logger.error("❌ Токен не найден! Добавьте BOT_TOKEN в переменные окружения Render")
     exit(1)
 
-# URL для webhook
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-bot.onrender.com")
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/webhook"
-
-# ==================== FLASK APP ====================
-
-app = Flask(__name__, static_folder='static')
-
 # ==================== БАЗА ДАННЫХ ====================
 
 def init_database():
@@ -52,7 +40,7 @@ def init_database():
     conn = sqlite3.connect('farm_bot.db', check_same_thread=False)
     cursor = conn.cursor()
     
-    # Таблица пользователей
+    # Таблица користувачів
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -63,7 +51,7 @@ def init_database():
         )
     ''')
     
-    # Таблица сессий
+    # Таблица сесій
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_sessions (
             user_id INTEGER PRIMARY KEY,
@@ -74,7 +62,7 @@ def init_database():
         )
     ''')
     
-    # Таблица корзин
+    # Таблица кошиків
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS carts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +73,7 @@ def init_database():
         )
     ''')
     
-    # Таблица заказов
+    # Таблица замовлень
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +90,7 @@ def init_database():
         )
     ''')
     
-    # Таблица элементов заказов
+    # Таблица елементів замовлень
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS order_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +101,7 @@ def init_database():
         )
     ''')
     
-    # Таблица сообщений
+    # Таблица повідомлень
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,7 +114,7 @@ def init_database():
         )
     ''')
     
-    # Таблица быстрых заказов
+    # Таблица швидких замовлень
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS quick_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,16 +136,16 @@ def init_database():
     logger.info("✅ База данных инициализирована")
 
 class Database:
-    """Класс для работы с базой данных"""
+    """Клас для роботи з базою даних"""
     
     @staticmethod
     def get_connection():
-        """Возвращает соединение с базой данных"""
+        """Повертає з'єднання з базою даних"""
         return sqlite3.connect('farm_bot.db', timeout=20, check_same_thread=False)
     
     @staticmethod
     def save_user(user_id: int, first_name: str = "", last_name: str = "", username: str = ""):
-        """Сохраняет или обновляет пользователя"""
+        """Зберігає або оновлює користувача"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -175,7 +163,7 @@ class Database:
     
     @staticmethod
     def get_user_session(user_id: int) -> Dict:
-        """Получает сессию пользователя"""
+        """Отримує сесію користувача"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -205,7 +193,7 @@ class Database:
     
     @staticmethod
     def save_user_session(user_id: int, state: str = "", temp_data: Dict = None, last_section: str = ""):
-        """Сохраняет сессию пользователя"""
+        """Зберігає сесію користувача"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -225,7 +213,7 @@ class Database:
     
     @staticmethod
     def clear_user_session(user_id: int):
-        """Очищает сессию пользователя"""
+        """Очищає сесію користувача"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -239,7 +227,7 @@ class Database:
     
     @staticmethod
     def add_to_cart(user_id: int, product_id: int, quantity: float) -> bool:
-        """Добавляет товар в корзину"""
+        """Додає товар до кошика"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -275,7 +263,7 @@ class Database:
     
     @staticmethod
     def get_cart_items(user_id: int) -> List[Dict]:
-        """Получает товары из корзины"""
+        """Отримує товари з кошика"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -303,7 +291,7 @@ class Database:
     
     @staticmethod
     def clear_cart(user_id: int):
-        """Очищает корзину"""
+        """Очищає кошик"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -317,7 +305,7 @@ class Database:
     
     @staticmethod
     def remove_from_cart(cart_id: int):
-        """Удаляет товар из корзины"""
+        """Видаляє товар з кошика"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -331,7 +319,7 @@ class Database:
     
     @staticmethod
     def create_order(order_data: Dict) -> int:
-        """Создает заказ"""
+        """Створює замовлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -381,7 +369,7 @@ class Database:
     
     @staticmethod
     def save_message(user_id: int, user_name: str, username: str, text: str, message_type: str):
-        """Сохраняет сообщение"""
+        """Зберігає повідомлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -401,7 +389,7 @@ class Database:
     def save_quick_order(user_id: int, user_name: str, username: str, product_id: int, 
                         product_name: str, quantity: float, phone: str = None, 
                         contact_method: str = "chat") -> int:
-        """Сохраняет быстрый заказ"""
+        """Зберігає швидке замовлення"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -423,7 +411,7 @@ class Database:
     
     @staticmethod
     def get_statistics() -> Dict:
-        """Возвращает статистику"""
+        """Повертає статистику"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -456,7 +444,7 @@ class Database:
         finally:
             conn.close()
 
-# ==================== ДАННЫЕ ПРОДУКТОВ ====================
+# ==================== ДАНІ ПРОДУКТІВ ====================
 
 PRODUCTS = [
     {
@@ -466,8 +454,7 @@ PRODUCTS = [
         "description": "Свіжі артишоки вищого ґатунку, зібрані вручну",
         "price": 350,
         "unit": "кг",
-        "image": "🥬",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/1.jpg"
+        "image": "🥬"
     },
     {
         "id": 2,
@@ -476,8 +463,7 @@ PRODUCTS = [
         "description": "Нарізана спаржа, готова до приготування, без пестицидів",
         "price": 280,
         "unit": "кг",
-        "image": "🌱",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/2.jpg"
+        "image": "🌱"
     },
     {
         "id": 3,
@@ -486,8 +472,7 @@ PRODUCTS = [
         "description": "Солодкі яблука сорту Голден, ідеальні для пирогів",
         "price": 60,
         "unit": "кг",
-        "image": "🍎",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/3.jpg"
+        "image": "🍎"
     },
     {
         "id": 4,
@@ -496,8 +481,7 @@ PRODUCTS = [
         "description": "Стиглий інжир прямо з саду, дуже соковитий",
         "price": 200,
         "unit": "кг",
-        "image": "🍈",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/4.jpg"
+        "image": "🍈"
     },
     {
         "id": 5,
@@ -506,8 +490,7 @@ PRODUCTS = [
         "description": "Великі смачні горіхи, багаті на вітаміни",
         "price": 300,
         "unit": "кг",
-        "image": "🌰",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/5.jpg"
+        "image": "🌰"
     },
     {
         "id": 6,
@@ -516,8 +499,7 @@ PRODUCTS = [
         "description": "Натуральний мед з власної пасіки",
         "price": 450,
         "unit": "літр",
-        "image": "🍯",
-        "photo_url": f"{RENDER_EXTERNAL_URL}/static/products/6.jpg"
+        "image": "🍯"
     }
 ]
 
@@ -557,10 +539,10 @@ COMPANY_INFO = {
     ]
 }
 
-# ==================== ГЕНЕРАТОРЫ КЛАВИАТУР ====================
+# ==================== ГЕНЕРАТОРИ КЛАВІАТУР ====================
 
 def create_inline_keyboard(buttons: List[List[Dict]]) -> InlineKeyboardMarkup:
-    """Создает inline клавиатуру"""
+    """Створює inline клавіатуру"""
     keyboard = []
     
     for row in buttons:
@@ -577,7 +559,7 @@ def create_inline_keyboard(buttons: List[List[Dict]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def get_main_menu() -> InlineKeyboardMarkup:
-    """Главное меню"""
+    """Головне меню"""
     buttons = [
         [{"text": "🏢 Про компанію", "callback_data": "company"}],
         [{"text": "📦 Наші продукти", "callback_data": "products"}],
@@ -591,12 +573,12 @@ def get_main_menu() -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_back_keyboard(back_to: str) -> InlineKeyboardMarkup:
-    """Возвращает кнопку 'Назад'"""
+    """Повертає кнопку 'Назад'"""
     buttons = [[{"text": "🔙 Назад", "callback_data": f"back_{back_to}"}]]
     return create_inline_keyboard(buttons)
 
 def get_products_menu() -> InlineKeyboardMarkup:
-    """Меню продуктов"""
+    """Меню продуктів"""
     buttons = []
     
     for product in PRODUCTS:
@@ -609,7 +591,7 @@ def get_products_menu() -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_product_detail_menu(product_id: int) -> InlineKeyboardMarkup:
-    """Меню деталей продукта"""
+    """Меню деталей продукту"""
     buttons = [
         [{"text": "🛒 Додати в кошик", "callback_data": f"add_to_cart_{product_id}"}],
         [{"text": "⚡ Швидке замовлення", "callback_data": f"quick_order_{product_id}"}],
@@ -618,7 +600,7 @@ def get_product_detail_menu(product_id: int) -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_quick_order_menu(product_id: int) -> InlineKeyboardMarkup:
-    """Меню быстрого заказа"""
+    """Меню швидкого замовлення"""
     buttons = [
         [{"text": "📞 Зателефонуйте мені", "callback_data": f"quick_call_{product_id}"}],
         [{"text": "💬 Напишіть мені в чат", "callback_data": f"quick_chat_{product_id}"}],
@@ -640,7 +622,7 @@ def get_faq_menu() -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_contact_menu() -> InlineKeyboardMarkup:
-    """Меню контактов"""
+    """Меню контактів"""
     buttons = [
         [{"text": "📞 Зателефонувати", "callback_data": "call_us"}],
         [{"text": "📧 Написати email", "callback_data": "email_us"}],
@@ -651,7 +633,7 @@ def get_contact_menu() -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_cart_menu(cart_items: List) -> InlineKeyboardMarkup:
-    """Меню корзины"""
+    """Меню корзини"""
     buttons = []
     
     if cart_items:
@@ -672,17 +654,17 @@ def get_cart_menu(cart_items: List) -> InlineKeyboardMarkup:
     return create_inline_keyboard(buttons)
 
 def get_order_confirmation_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура подтверждения заказа"""
+    """Клавіатура підтвердження замовлення"""
     buttons = [
         [{"text": "✅ Так, продовжити", "callback_data": "confirm_order_yes"}],
         [{"text": "❌ Ні, скасувати", "callback_data": "confirm_order_no"}]
     ]
     return create_inline_keyboard(buttons)
 
-# ==================== УТИЛИТЫ ДЛЯ ВАЛИДАЦИИ ====================
+# ==================== УТІЛІТИ ДЛЯ ВАЛІДАЦІЇ ====================
 
 def parse_quantity(text: str) -> Tuple[bool, float, str]:
-    """Парсит количество"""
+    """Парсить кількість"""
     text = text.strip().replace(" ", "")
     match = re.search(r'(\d+(?:[.,]\d+)?)', text)
     
@@ -703,7 +685,7 @@ def parse_quantity(text: str) -> Tuple[bool, float, str]:
         return False, 0, "❌ Некоректний формат числа"
 
 def validate_phone(phone: str) -> Tuple[bool, str]:
-    """Валидирует телефон"""
+    """Валідує телефон"""
     phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     
     if re.match(r'^(\+38|38)?0\d{9}$', phone):
@@ -720,7 +702,7 @@ def validate_phone(phone: str) -> Tuple[bool, str]:
     
     return False, phone
 
-# ==================== ГЕНЕРАТОРЫ ТЕКСТА ====================
+# ==================== ГЕНЕРАТОРИ ТЕКСТУ ====================
 
 def get_welcome_text() -> str:
     return """
@@ -758,7 +740,7 @@ def get_company_text() -> str:
     return text
 
 def get_product_text(product_id: int) -> str:
-    """Текст продукта"""
+    """Текст продукту"""
     product = next((p for p in PRODUCTS if p["id"] == product_id), None)
     if not product:
         return "❌ Продукт не знайдено"
@@ -785,7 +767,7 @@ def get_product_text(product_id: int) -> str:
     """
 
 def get_quick_order_text(product_id: int) -> str:
-    """Текст быстрого заказа"""
+    """Текст швидкого замовлення"""
     product = next((p for p in PRODUCTS if p["id"] == product_id), None)
     if not product:
         return "❌ Продукт не знайдено"
@@ -830,7 +812,7 @@ def get_contact_text() -> str:
     """
 
 def get_cart_text(cart_items: List[Dict]) -> str:
-    """Текст корзины"""
+    """Текст корзини"""
     if not cart_items:
         return "🛒 <b>Ваша корзина порожня</b>\n\nДодайте товари з каталогу!"
     
@@ -877,7 +859,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         Database.clear_user_session(user_id)
         
         welcome = get_welcome_text()
-        await context.bot.send_message(chat_id, welcome, reply_markup=get_main_menu(), parse_mode='HTML')
+        await update.message.reply_text(welcome, reply_markup=get_main_menu(), parse_mode='HTML')
         Database.save_user_session(user_id, last_section="main_menu")
         
     except Exception as e:
@@ -886,6 +868,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     await update.message.reply_text("ℹ️ Допомога: оберіть опцію з меню", reply_markup=get_main_menu())
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /cancel"""
+    user = update.effective_user
+    user_id = user.id
+    
+    Database.clear_user_session(user_id)
+    welcome = get_welcome_text()
+    await update.message.reply_text(welcome, reply_markup=get_main_menu(), parse_mode='HTML')
+    Database.save_user_session(user_id, last_section="main_menu")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик inline кнопок"""
@@ -1152,7 +1144,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contact_info += "🏠 Київська область\n"
                 contact_info += "📌 село Зелене, вул. Садова, 42\n"
                 contact_info += "🗺️ Координати: 50.4504° N, 30.5245° E\n\n"
-                contact_info += "<i>Самовивіз: Пн-Сб 10:00-17:00</i>"
+                contact_info += "<i>Самовивіз: Пн-Sб 10:00-17:00</i>"
             
             await query.edit_message_text(contact_info, reply_markup=get_back_keyboard("contact"), parse_mode='HTML')
         
@@ -1485,76 +1477,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"❌ ОШИБКА В message_handler: {e}")
 
-# ==================== FLASK РОУТЫ ====================
+# ==================== ЗАПУСК БОТА ====================
 
-@app.route('/')
-def home():
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Бот ферми "Смак природи"</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2e7d32;
-        }
-        .status {
-            padding: 10px;
-            background: #e8f5e9;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌱 Бот ферми "Смак природи"</h1>
-        <div class="status">
-            <h3>✅ Бот работает и готов к приему сообщений!</h3>
-            <p>Бот успешно запущен и подключен к Telegram API.</p>
-        </div>
-        <p><a href="/health">Проверить статус (health check)</a></p>
-        <p><a href="/ping">Пинг сервера</a></p>
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
-@app.route('/ping')
-def ping():
-    return "pong", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Endpoint для получения обновлений от Telegram"""
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put(update)
-        return 'ok', 200
-    except Exception as e:
-        logger.error(f"❌ Ошибка в webhook: {e}")
-        return 'error', 500
-
-# ==================== ЗАПУСК ====================
-
-if __name__ == "__main__":
+def main():
+    """Основная функция запуска бота"""
     # Инициализируем базу данных
     init_database()
     
@@ -1572,6 +1498,7 @@ if __name__ == "__main__":
     logger.info(f"• Активних кошиків: {stats.get('active_carts', 0)}")
     logger.info(f"• Продуктів у базі: {len(PRODUCTS)}")
     logger.info("=" * 80)
+    logger.info("🔄 Очікування повідомлень...\n")
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
@@ -1579,33 +1506,12 @@ if __name__ == "__main__":
     # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", start))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    # Настраиваем webhook
-    async def setup_webhook():
-        await application.initialize()
-        await application.bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-        logger.info("✅ Бот готов к работе!")
-    
-    # Запускаем настройку webhook
-    asyncio.run(setup_webhook())
-    
-    # Запускаем Flask в отдельном потоке
-    def run_flask():
-        port = int(os.environ.get('PORT', 8080))
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-    
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"✅ Flask сервер запущен на порту {os.environ.get('PORT', 8080)}")
-    logger.info("🔄 Очікування повідомлень...\n")
-    
-    # Запускаем обработку обновлений
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False
-    )
+    # Запускаем бота
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
