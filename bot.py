@@ -1796,53 +1796,48 @@ app = Flask(__name__, static_folder='static')
 @app.route('/')
 def home():
     return """
-    <!DOCTYPE html>
-
-@app.route('/')
-def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Бот ферми "Смак природи"</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                max-width: 800px;
-                margin: 0 auto;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }
-            .container {
-                background: white;
-                padding: 30px;
-                border-radius: 10px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }
-            h1 {
-                color: #2e7d32;
-            }
-            .status {
-                padding: 10px;
-                background: #e8f5e9;
-                border-radius: 5px;
-                margin: 20px 0;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🌱 Бот ферми "Смак природи"</h1>
-            <div class="status">
-                <h3>✅ Бот работает и готов к приему сообщений!</h3>
-                <p>Бот успешно запущен и подключен к Telegram API.</p>
-            </div>
-            <p><a href="/health">Проверить статус (health check)</a></p>
-            <p><a href="/ping">Пинг сервера</a></p>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Бот ферми "Смак природи"</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2e7d32;
+        }
+        .status {
+            padding: 10px;
+            background: #e8f5e9;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌱 Бот ферми "Смак природи"</h1>
+        <div class="status">
+            <h3>✅ Бот работает и готов к приему сообщений!</h3>
+            <p>Бот успешно запущен и подключен к Telegram API.</p>
         </div>
-    </body>
-    </html>
-    """
+        <p><a href="/health">Проверить статус (health check)</a></p>
+        <p><a href="/ping">Пинг сервера</a></p>
+    </div>
+</body>
+</html>
+"""
 
 @app.route('/health')
 def health():
@@ -1882,4 +1877,5 @@ if __name__ == "__main__":
     # Запускаем бота
     asyncio.run(main())
     
+
 
